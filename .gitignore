@@ -1,0 +1,15 @@
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+Makefile
+*.cmake.user
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+.DS_Store
