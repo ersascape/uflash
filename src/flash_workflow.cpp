@@ -602,14 +602,8 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
             const bool large_transfer_profile = is_large_transfer_profile(buf.size(), use_named_download);
             const bool use_fast_lane = fast_mode_active && large_transfer_profile;
             const bool debug_fast_lane = debug_fast_lane_enabled && fc.id == "Super";
-            // CODE2/YAFFS2 partitions are NAND-backed (modem, DSP, etc.) and have
-            // stricter ACK timing than eMMC.  Cap them at 32 KB to avoid the 60 s
-            // pipeline ACK timeout that triggers cascading write-timeout failures.
-            const bool is_nand_type = (fc.type == "CODE2" || fc.type == "YAFFS_IMG2"
-                                    || fc.type == "CODE264" || fc.type == "YAFFS_IMG264");
-            const size_t large_chunk = is_nand_type ? kLargeImageStartChunkSize : kLargeImageNamedChunkSize;
             const size_t base_chunk_size = large_transfer_profile
-                ? large_chunk
+                ? kLargeImageNamedChunkSize
                 : choose_download_chunk_size(fc, buf.size());
             size_t chunk_size = large_transfer_profile ? kLargeImageStartChunkSize : base_chunk_size;
             size_t max_recovery_chunk_size = base_chunk_size;
@@ -739,15 +733,7 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
                     }
                     bsl.drain_recv();
                     bsl.clear_halts();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    // Send a short CONNECT frame (8 bytes) to terminate any partial
-                    // frame reception on FDL2's side.  NAND-backed partitions can leave
-                    // the OUT endpoint NAKing after an ACK timeout; the CONNECT frame
-                    // forces FDL2 back to idle so subsequent midst_data writes are
-                    // accepted.  ACK failure is expected mid-download and is ignored.
-                    bsl.send_command(BSL_CMD_CONNECT, {}, 3000);
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    bsl.drain_recv();
                     if (use_packet_pipeline) {
                         use_packet_pipeline = false;
                         fast_lane_fell_back = true;
