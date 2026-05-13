@@ -33,7 +33,7 @@ constexpr size_t kCode264ChunkSize = 0xE000;
 constexpr size_t kBootLoader2ChunkSize = 2112;
 constexpr size_t kMinAdaptiveChunkSize = 0x400;
 constexpr size_t kMinNamedTailChunkSize = 0x20;
-constexpr uint64_t kLargeImageThreshold = 256ULL * 1024ULL * 1024ULL;
+constexpr uint64_t kLargeImageThreshold = 8ULL * 1024ULL * 1024ULL; // 8 MB: use fast chunk strategy for medium+ partitions
 constexpr size_t kLargeImageNamedChunkSize = 0x8000;
 constexpr size_t kLargeImageStartChunkSize = 0x8000;
 constexpr size_t kLargeImageMinChunkSize = 0x2000;
@@ -178,12 +178,8 @@ bool should_auto_pad_named_download(const upac::XmlFileConfig& fc) {
     return fc.type == "CODE2" || fc.type == "YAFFS_IMG2" || fc.type == "CHECK_NV2";
 }
 
-bool is_large_transfer_profile(const upac::XmlFileConfig& fc, uint64_t file_size, bool use_named_download) {
-    return use_named_download && (file_size >= kLargeImageThreshold || file_size >= 0x100000000ULL || fc.id == "Super");
-}
-
-bool is_super_fast_lane_candidate(const upac::XmlFileConfig& fc) {
-    return fc.id == "Super" || fc.id_name == "super";
+bool is_large_transfer_profile(uint64_t file_size, bool use_named_download) {
+    return use_named_download && file_size >= kLargeImageThreshold;
 }
 
 double bytes_to_mib(size_t bytes) {
@@ -603,15 +599,13 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
             fclose(f);
 
             const bool use_named_download = !fc.id_name.empty() && (fc.type.find("2") != std::string::npos || fc.base_address == 0);
-            const bool large_transfer_profile = is_large_transfer_profile(fc, buf.size(), use_named_download);
-            const bool use_fast_lane = fast_mode_active && large_transfer_profile && is_super_fast_lane_candidate(fc);
+            const bool large_transfer_profile = is_large_transfer_profile(buf.size(), use_named_download);
+            const bool use_fast_lane = fast_mode_active && large_transfer_profile;
             const bool debug_fast_lane = debug_fast_lane_enabled && fc.id == "Super";
             const size_t base_chunk_size = large_transfer_profile
                 ? kLargeImageNamedChunkSize
                 : choose_download_chunk_size(fc, buf.size());
-            size_t chunk_size = large_transfer_profile
-                ? (use_fast_lane ? kLargeImageStartChunkSize : kLargeImageStartChunkSize)
-                : base_chunk_size;
+            size_t chunk_size = large_transfer_profile ? kLargeImageStartChunkSize : base_chunk_size;
             size_t max_recovery_chunk_size = base_chunk_size;
             int chunk_delay_ms = 0;
             int stable_chunk_count = 0;
@@ -625,7 +619,6 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
             std::string last_progress_line;
             auto transfer_start = std::chrono::steady_clock::now();
             size_t fast_lane_packet_logs = 0;
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             bsl.drain_recv();
 
             if (use_named_download && should_auto_pad_named_download(fc)) {
@@ -640,9 +633,7 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
             uint32_t checksum = compute_download_checksum(fc, buf);
             if (use_named_download) {
                 if (large_transfer_profile) {
-                    chunk_size = use_fast_lane
-                        ? std::min(chunk_size, kLargeImageStartChunkSize)
-                        : std::min(chunk_size, kLargeImageStartChunkSize);
+                    chunk_size = std::min(chunk_size, kLargeImageStartChunkSize);
                     chunk_delay_ms = 0;
                 } else {
                     chunk_size = std::min(chunk_size, static_cast<size_t>(0x1000));
