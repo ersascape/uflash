@@ -603,11 +603,14 @@ void BslProtocol::clear_halts() {
 }
 
 void BslProtocol::drain_recv() {
-    // drain any pending packets FDL2 may have queued after an error
-    for (int i = 0; i < 8; ++i) {
-        uint16_t type;
-        std::vector<uint8_t> out;
-        if (!receive_packet(type, out, 200)) break; // stop when nothing pending
+    // Raw byte drain: faster and safe when the device may have queued partial
+    // or malformed frames that would cause receive_packet() to spin on its
+    // internal poll loop for the full timeout.
+    uint8_t garbage[4096];
+    for (int i = 0; i < 16; ++i) {
+        if (dev_.read(garbage, sizeof(garbage), 30) <= 0) {
+            break;
+        }
     }
 }
 

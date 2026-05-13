@@ -34,10 +34,10 @@ constexpr size_t kBootLoader2ChunkSize = 2112;
 constexpr size_t kMinAdaptiveChunkSize = 0x400;
 constexpr size_t kMinNamedTailChunkSize = 0x20;
 constexpr uint64_t kLargeImageThreshold = 256ULL * 1024ULL * 1024ULL;
-constexpr size_t kLargeImageNamedChunkSize = 0x10000;
+constexpr size_t kLargeImageNamedChunkSize = 0x8000;
 constexpr size_t kLargeImageStartChunkSize = 0x8000;
 constexpr size_t kLargeImageMinChunkSize = 0x2000;
-constexpr size_t kFastLaneWindowSize = 0x10000000;
+constexpr size_t kFastLaneWindowSize = 0x4000000; // 64 MB — sync before eMMC erase-boundary stalls accumulate
 constexpr size_t kLargeImageRecoveryDistance = 16 * 1024 * 1024;
 constexpr size_t kLargeImageProbeDistance = 256 * 1024 * 1024;
 constexpr int kDefaultEndDataTimeoutMs = 30000;
@@ -204,7 +204,7 @@ std::string hex_preview(const std::vector<uint8_t>& data, size_t max_bytes = 16)
 
 size_t next_large_transfer_chunk(size_t chunk_size) {
     static constexpr size_t kSteps[] = {
-        0x2000, 0x4000, 0x8000, 0x10000
+        0x2000, 0x4000, 0x8000
     };
     for (size_t step : kSteps) {
         if (step > chunk_size) {
@@ -216,7 +216,7 @@ size_t next_large_transfer_chunk(size_t chunk_size) {
 
 size_t prev_large_transfer_chunk(size_t chunk_size) {
     static constexpr size_t kSteps[] = {
-        0x2000, 0x4000, 0x8000, 0x10000
+        0x2000, 0x4000, 0x8000
     };
     size_t prev = kSteps[0];
     for (size_t step : kSteps) {
@@ -659,7 +659,7 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
             }
 
             bool use_packet_pipeline = use_fast_lane;
-            size_t pipeline_depth = use_fast_lane ? 24 : 4;
+            size_t pipeline_depth = use_fast_lane ? 6 : 4;
             PacketPipeline pipeline(bsl, buf, chunk_size, use_packet_pipeline, pipeline_depth);
             pipeline.start(0);
 
@@ -795,9 +795,15 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
                 if (use_packet_pipeline && next_fast_lane_window != 0 && offset >= next_fast_lane_window) {
                     pipeline.stop();
                     std::cout << "\n    fast lane window complete at offset=" << offset
-                              << ", cooling down before continuing...\n";
-                    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+                              << ", syncing FDL2...\n";
                     bsl.drain_recv();
+                    bsl.clear_halts();
+                    // CONNECT resets the FDL2 watchdog timer mid-transfer, matching
+                    // ResearchDownload's behaviour every ~128 MB.  ACK failure is
+                    // non-fatal; the download state on the device is not reset.
+                    if (!bsl.connect()) {
+                        std::cout << "    fast lane sync: CONNECT did not ACK, continuing...\n";
+                    }
                     pipeline.reset(offset, chunk_size);
                     next_fast_lane_window += kFastLaneWindowSize;
                 }

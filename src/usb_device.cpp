@@ -53,38 +53,26 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
     libusb_set_auto_detach_kernel_driver(handle, 1);
 
     int active_config = 0;
-    if (libusb_get_configuration(handle, &active_config) == 0 && active_config <= 0) {
+    if (libusb_get_configuration(handle, &active_config) == 0 && active_config != 1) {
         if (libusb_set_configuration(handle, 1) != 0) {
             return false;
         }
     }
 
-    int claim_result = libusb_claim_interface(handle, selection.interface_number);
-    if (claim_result != 0) {
+    if (libusb_claim_interface(handle, selection.interface_number) != 0) {
         return false;
     }
 
-    if (selection.alt_setting > 0) {
-        int alt_result = libusb_set_interface_alt_setting(handle,
-                                                          selection.interface_number,
-                                                          selection.alt_setting);
-        if (alt_result != 0) {
-            libusb_release_interface(handle, selection.interface_number);
-            return false;
-        }
-    }
+    // Always issue SET_INTERFACE even for altsetting 0.  On Linux, this is
+    // required to load the endpoint descriptors into the kernel's URB state
+    // machine; skipping it causes the first bulk transfer to return
+    // LIBUSB_ERROR_TIMEOUT on some kernels even though the endpoint is valid.
+    libusb_set_interface_alt_setting(handle,
+                                     selection.interface_number,
+                                     selection.alt_setting);
 
-    // Some implementations expose a CDC-style control interface and expect DTR/RTS
-    // to be asserted before the bootrom starts draining the bulk endpoints.
-    libusb_control_transfer(handle,
-                            0x21,
-                            34,
-                            0x03,
-                            static_cast<uint16_t>(selection.interface_number),
-                            nullptr,
-                            0,
-                            1000);
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    // Give the kernel driver handoff time to complete before the first transfer.
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
     return true;
 }
 
@@ -332,11 +320,15 @@ void UsbDevice::clear_halt() {
 }
 
 void UsbDevice::dump_descriptors() {
-    if (libusb_init(nullptr) < 0) return;
+    libusb_context* ctx = nullptr;
+    if (libusb_init(&ctx) < 0) return;
 
     libusb_device** devs;
-    ssize_t count = libusb_get_device_list(nullptr, &devs);
-    if (count < 0) return;
+    ssize_t count = libusb_get_device_list(ctx, &devs);
+    if (count < 0) {
+        libusb_exit(ctx);
+        return;
+    }
 
     for (ssize_t i = 0; i < count; ++i) {
         libusb_device_descriptor desc;
@@ -366,6 +358,7 @@ void UsbDevice::dump_descriptors() {
         }
     }
     libusb_free_device_list(devs, 1);
+    libusb_exit(ctx);
 }
 
 } // namespace uflash
