@@ -56,7 +56,12 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
     // Explicit detach for Linux (belt-and-suspenders; no-op / NOT_SUPPORTED on macOS).
     // LIBUSB_ERROR_NOT_FOUND means no driver was bound — fine.
     int dr = libusb_detach_kernel_driver(handle, selection.interface_number);
-    if (dr != 0 && dr != LIBUSB_ERROR_NOT_FOUND && dr != LIBUSB_ERROR_NOT_SUPPORTED) {
+    // NOT_FOUND: no driver was bound (fine on any OS).
+    // NOT_SUPPORTED / ACCESS: macOS — IOKit does not support explicit detach,
+    // auto-detach + set_configuration handles it instead.  Both are silent.
+    if (dr != 0 && dr != LIBUSB_ERROR_NOT_FOUND
+                && dr != LIBUSB_ERROR_NOT_SUPPORTED
+                && dr != LIBUSB_ERROR_ACCESS) {
         std::cerr << "usb: detach kernel driver: " << libusb_error_name(dr) << "\n";
     }
 

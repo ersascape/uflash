@@ -1005,13 +1005,13 @@ int run_with_connected_device(std::unique_ptr<UsbDevice>& dev, BslProtocol& bsl,
     dev.reset();
 
     std::unique_ptr<UsbDevice> dev2;
-    for (int i = 0; i < 40; ++i) {
+    for (int i = 0; i < 80; ++i) {
         auto opt2 = UsbDevice::find_any();
         if (opt2) {
             dev2 = std::move(*opt2);
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (!dev2) {
         std::cerr << "error: device did not re-appear.\n";
@@ -1023,15 +1023,13 @@ int run_with_connected_device(std::unique_ptr<UsbDevice>& dev, BslProtocol& bsl,
         std::this_thread::sleep_for(std::chrono::milliseconds(options.fdl2_settle_ms));
     }
 
-    std::cout << "Clearing endpoint halts for Stage 2...\n";
     dev2->clear_halt();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     BslProtocol bsl2(*dev2);
     dev2->set_debug_io(options.debug_protocol);
     bsl2.set_debug_protocol(options.debug_protocol);
     std::cout << "Attempting Stage 2 Handshake...\n";
-    if (!bsl2.handshake(3000)) {
+    if (!bsl2.handshake(5000)) {
         std::cout << "  Sync silent, trying CONNECT directly...\n";
         if (!bsl2.connect()) {
             std::cerr << "  error: Stage 2 Handshake failed.\n";

@@ -19,7 +19,7 @@ struct CliOptions {
     bool disable_transcode = false;
     bool debug_fast_lane = false;
     bool debug_protocol = false;
-    int fdl2_settle_ms = 5000;
+    int fdl2_settle_ms = 0;
     FlashMode flash_mode = FlashMode::Full;
     std::string dump_out_dir;
     std::vector<std::string> skip_list;
