@@ -208,7 +208,6 @@ int UsbDevice::write(const uint8_t* data, size_t len, unsigned int timeout_ms) {
         std::cout << "usb: write len=" << len << " timeout=" << timeout_ms << "ms\n";
     }
     constexpr size_t kBulkSlice = 4096;
-    const bool large_transfer = len > kBulkSlice;
     int r = 0;
 
     for (int retry = 0; retry < 3; ++retry) {
@@ -231,9 +230,6 @@ int UsbDevice::write(const uint8_t* data, size_t len, unsigned int timeout_ms) {
 
             if (r == 0 && transferred == static_cast<int>(slice)) {
                 total_transferred += slice;
-                if (large_transfer) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                }
                 continue;
             }
 

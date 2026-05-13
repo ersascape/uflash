@@ -649,7 +649,14 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
                 return true;
             }
 
-            bool use_packet_pipeline = use_fast_lane;
+            // Enable the pipeline for all large transfers, not just when
+            // DisableTransCode is active.  build_midst_data_packet() applies
+            // HDLC byte-stuffing when needed, so pre-built frames are always
+            // correct.  The pipeline lets the encoder run concurrently with
+            // the previous ACK round-trip, and the pipeline's write_fast()
+            // path sends the whole pre-built frame in a single bulk transfer
+            // rather than 4 KB slices, eliminating the 1 ms/slice sleep.
+            bool use_packet_pipeline = large_transfer_profile;
             size_t pipeline_depth = use_fast_lane ? 6 : 4;
             PacketPipeline pipeline(bsl, buf, chunk_size, use_packet_pipeline, pipeline_depth);
             pipeline.start(0);
@@ -700,9 +707,11 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
                         pipeline_popped = true;
                         sent_size = packet.size;
                         if (debug_fast_lane && fast_lane_packet_logs < 6) {
-                            std::cout << "    fast lane debug: offset=" << packet.offset
+                            std::cout << "    " << (use_fast_lane ? "fast lane" : "pipeline")
+                                      << " debug: offset=" << packet.offset
                                       << " payload=" << packet.size
                                       << " frame=" << packet.frame.size()
+                                      << (use_fast_lane ? " [no-transcode]" : " [hdlc]")
                                       << " ack=60000ms\n";
                             ++fast_lane_packet_logs;
                         }
@@ -732,13 +741,15 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
                         max_recovery_chunk_size = std::min(max_recovery_chunk_size, chunk_size);
                         chunk_delay_ms = std::max(chunk_delay_ms, 1);
                         freeze_recovery = true;
-                        std::cout << "\n    fast lane fallback: switching to normal transfer pipeline at chunk="
+                        std::cout << "\n    " << (use_fast_lane ? "fast lane" : "pipeline")
+                                  << " fallback: switching to non-pipelined transfer at chunk="
                                   << chunk_size << " delay=" << chunk_delay_ms << "ms\n";
                         if (debug_fast_lane) {
-                            std::cout << "    fast lane debug: fallback at offset=" << offset
+                            std::cout << "    " << (use_fast_lane ? "fast lane" : "pipeline")
+                                      << " debug: fallback at offset=" << offset
                                       << " remaining=" << remaining
                                       << " last_attempt=" << sent_size
-                                      << " frame_mode=no-transcode\n";
+                                      << " frame_mode=" << (use_fast_lane ? "no-transcode" : "hdlc") << "\n";
                         }
                     }
                     pipeline.reset(offset, chunk_size);
