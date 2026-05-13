@@ -50,16 +50,14 @@ std::optional<EndpointSelection> find_bulk_endpoints(const libusb_config_descrip
 }
 
 bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSelection& selection) {
-    // Enable auto-detach so libusb handles driver detachment on claim_interface.
+    // Enable auto-detach so libusb handles driver detachment during claim.
     libusb_set_auto_detach_kernel_driver(handle, 1);
 
-    // Explicitly detach any kernel driver (e.g. cdc_acm that Linux loads
-    // automatically on some composite USB devices).  LIBUSB_ERROR_NOT_FOUND
-    // means no driver was bound — that is fine.  Auto-detach alone is
-    // unreliable on older kernels; both are needed for robustness.
+    // Explicit detach for Linux (belt-and-suspenders; no-op / NOT_SUPPORTED on macOS).
+    // LIBUSB_ERROR_NOT_FOUND means no driver was bound — fine.
     int dr = libusb_detach_kernel_driver(handle, selection.interface_number);
     if (dr != 0 && dr != LIBUSB_ERROR_NOT_FOUND && dr != LIBUSB_ERROR_NOT_SUPPORTED) {
-        std::cerr << "usb: detach kernel driver returned " << libusb_error_name(dr) << "\n";
+        std::cerr << "usb: detach kernel driver: " << libusb_error_name(dr) << "\n";
     }
 
     int active_config = 0;
@@ -76,19 +74,29 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
         return false;
     }
 
-    // DO NOT send SET_INTERFACE here.  The Unisoc BROM implements only the
-    // minimum USB control requests (GET_DESCRIPTOR, SET_ADDRESS,
-    // SET_CONFIGURATION).  Sending SET_INTERFACE causes the BROM to stall or
-    // enter an error state on some chip variants, after which the bulk OUT
-    // endpoint stops ACKing data and every write returns LIBUSB_ERROR_TIMEOUT.
-    // Only send it for non-zero alt settings where it is actually required.
-    if (selection.alt_setting > 0) {
-        libusb_set_interface_alt_setting(handle,
-                                         selection.interface_number,
-                                         selection.alt_setting);
-    }
+    // SET_INTERFACE to alt 0: on macOS this initialises the IOKit interface
+    // service before bulk transfers can be issued.  Ignore errors; a BROM
+    // that does not implement this request will stall ep0 but the bulk
+    // endpoints remain functional.
+    libusb_set_interface_alt_setting(handle,
+                                     selection.interface_number,
+                                     selection.alt_setting);
 
-    // Give kernel driver handoff and any BROM-side USB re-init time to settle.
+    // SET_CONTROL_LINE_STATE (DTR|RTS): Unisoc BROMs that enumerate as CDC
+    // ACM require this before the bulk OUT endpoint will accept data.  This
+    // was the original code path that made macOS work; removing it causes
+    // every subsequent bulk write to time out.  Ignore the return value;
+    // vendor-class interfaces will NAK or STALL the control transfer, which
+    // does not affect the bulk endpoints.
+    libusb_control_transfer(handle,
+                            0x21,   // bmRequestType: Class | Interface | H2D
+                            34,     // bRequest: SET_CONTROL_LINE_STATE
+                            0x03,   // wValue: DTR | RTS
+                            static_cast<uint16_t>(selection.interface_number),
+                            nullptr,
+                            0,
+                            1000);
+
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     return true;
 }
