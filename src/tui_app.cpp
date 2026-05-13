@@ -1,418 +1,479 @@
+// uflash-tui  — FTXUI-based frontend for uflash
+//
+// Screen 1: partition selector (j/k, space, a, p/f, t, enter)
+// Screen 2: live flash progress with animated gauge + log
+
 #include "upac/pac_reader.h"
 #include "upac/xml_config.h"
 
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <termios.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/event.hpp>
+#include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/color.hpp>
+#include <ftxui/screen/terminal.hpp>
 
-#include <algorithm>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <chrono>
-#include <csignal>
-#include <cstdio>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <iomanip>
-#include <iostream>
-#include <optional>
+#include <mutex>
 #include <regex>
-#include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
+using namespace ftxui;
 
-namespace {
-
-struct TerminalGuard {
-    termios original {};
-    bool active = false;
-
-    bool enable_raw() {
-        if (!isatty(STDIN_FILENO)) return false;
-        if (tcgetattr(STDIN_FILENO, &original) != 0) return false;
-        termios raw = original;
-        raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-        raw.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
-        raw.c_oflag &= ~(OPOST);
-        raw.c_cflag |= CS8;
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 1;
-        if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return false;
-        active = true;
-        return true;
-    }
-
-    void disable_raw() {
-        if (active) {
-            tcsetattr(STDIN_FILENO, TCSAFLUSH, &original);
-            active = false;
-        }
-    }
-
-    ~TerminalGuard() {
-        disable_raw();
-    }
-};
-
-struct AltScreenGuard {
-    AltScreenGuard() {
-        std::cout << "\x1b[?1049h\x1b[?25l" << std::flush;
-    }
-    ~AltScreenGuard() {
-        std::cout << "\x1b[?25h\x1b[?1049l" << std::flush;
-    }
-};
+// ─── types ────────────────────────────────────────────────────────────────────
 
 struct PartitionItem {
-    std::string id;
-    std::string id_name;
-    std::string type;
-    uint64_t size_bytes = 0;
+    std::string id, block, type;
+    uint64_t size = 0;
     bool selected = true;
 };
 
-struct ScreenSize {
-    int rows = 32;
-    int cols = 120;
-};
-
-enum class FlashMode {
-    Preserve,
-    Full,
-};
-
-enum class Key {
-    None,
-    Up,
-    Down,
-    Left,
-    Right,
-    Enter,
-    Space,
-    Quit,
-    ToggleAll,
-    ToggleModePreserve,
-    ToggleModeFull,
-    ToggleTranscode,
-    ToggleDebugFast,
-    Start,
-};
-
-struct SessionConfig {
-    FlashMode flash_mode = FlashMode::Preserve;
+struct Opts {
+    bool preserve_layout   = true;
     bool disable_transcode = false;
-    bool debug_fast_lane = false;
+    bool debug_fast_lane   = false;
 };
 
-struct FlashProgress {
-    std::string current_partition;
-    int percent = 0;
-    std::string detail;
-    std::deque<std::string> logs;
-    bool finished = false;
-    int exit_code = -1;
+struct FlashState {
+    std::string partition;
+    int     percent   = 0;
+    double  speed     = 0.0;
+    double  mib_done  = 0.0;
+    double  mib_total = 0.0;
+    std::deque<std::string> log;
+    bool done      = false;
+    int  exit_code = -1;
+    std::mutex mtx;
 };
 
-ScreenSize get_screen_size() {
-    winsize ws {};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-        int rows = static_cast<int>(ws.ws_row);
-        int cols = static_cast<int>(ws.ws_col);
-        rows = std::max(20, std::min(rows, 60));
-        cols = std::max(80, std::min(cols, 140));
-        return {rows, cols};
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+static std::string human_size(uint64_t b) {
+    if (b == 0) return "—";
+    std::ostringstream s;
+    s << std::fixed;
+    if      (b >= (1ULL << 30)) s << std::setprecision(1) << b / double(1ULL << 30) << " GiB";
+    else if (b >= (1ULL << 20)) s << std::setprecision(0) << b / double(1ULL << 20) << " MiB";
+    else                         s << b << " B";
+    return s.str();
+}
+
+static std::vector<PartitionItem> load_partitions(const fs::path& pac_path) {
+    auto r = upac::PacReader::open(pac_path);
+    if (!r) throw std::runtime_error("cannot open PAC");
+    upac::XmlProductConfig cfg;
+    if (!upac::parse_xml_config(r->xml_config(), cfg))
+        throw std::runtime_error("cannot parse PAC XML");
+    auto infos = r->file_infos();
+    std::vector<PartitionItem> out;
+    for (auto& fc : cfg.files) {
+        if (fc.id == "FDL" || fc.id == "FDL2" || fc.type == "FDL") continue;
+        PartitionItem p;
+        p.id = fc.id; p.block = fc.id_name; p.type = fc.type;
+        p.selected = fc.type.find("Erase") == std::string::npos;
+        for (auto& fi : infos) {
+            std::string fid = fi.id;
+            fid.erase(std::find(fid.begin(), fid.end(), '\0'), fid.end());
+            if (fid == fc.id) { p.size = fi.size; break; }
+        }
+        out.push_back(std::move(p));
     }
-    return {};
-}
-
-std::string fit_text(const std::string& text, int width) {
-    if (width <= 0) return "";
-    if (static_cast<int>(text.size()) <= width) return text;
-    if (width <= 3) return text.substr(0, width);
-    return text.substr(0, width - 3) + "...";
-}
-
-std::string pad_right(const std::string& text, int width) {
-    if (width <= 0) return "";
-    std::string out = fit_text(text, width);
-    if (static_cast<int>(out.size()) < width) out += std::string(width - out.size(), ' ');
     return out;
 }
 
-std::string human_mib(uint64_t bytes) {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(bytes >= 100ULL * 1024ULL * 1024ULL ? 0 : 1)
-        << (static_cast<double>(bytes) / (1024.0 * 1024.0)) << " MiB";
-    return out.str();
+static void parse_flash_line(const std::string& line, FlashState& st) {
+    // Extract: [PartName] and Progress: N% (done/total MiB, speed MiB/s
+    static const std::regex part_re(R"(\[([A-Za-z0-9_\-\.]+)\])");
+    static const std::regex prog_re(R"(Progress:\s*(\d+)%\s*\(([0-9.]+)/([0-9.]+) MiB[^,]*, ([0-9.]+) MiB/s)");
+    std::smatch m;
+    if (std::regex_search(line, m, part_re)) st.partition = m[1];
+    if (std::regex_search(line, m, prog_re)) {
+        st.percent   = std::stoi(m[1]);
+        st.mib_done  = std::stod(m[2]);
+        st.mib_total = std::stod(m[3]);
+        st.speed     = std::stod(m[4]);
+    }
 }
 
-Key read_key() {
-    char c = 0;
-    ssize_t n = ::read(STDIN_FILENO, &c, 1);
-    if (n <= 0) return Key::None;
-    if (c == '\x1b') {
-        char seq[2] = {};
-        if (::read(STDIN_FILENO, &seq[0], 1) <= 0) return Key::Quit;
-        if (::read(STDIN_FILENO, &seq[1], 1) <= 0) return Key::Quit;
-        if (seq[0] == '[') {
-            if (seq[1] == 'A') return Key::Up;
-            if (seq[1] == 'B') return Key::Down;
-            if (seq[1] == 'C') return Key::Right;
-            if (seq[1] == 'D') return Key::Left;
+// ─── shared header ────────────────────────────────────────────────────────────
+
+static Element make_header(const std::string& pac_name, const Opts& opts) {
+    return window(
+        hbox({ text(" ⚡ uflash ") | bold | color(Color::Cyan1) }),
+        hbox({
+            text(pac_name) | flex | color(Color::White),
+            separatorLight(),
+            text(opts.preserve_layout ? " preserve " : " full-flash ")
+                | color(opts.preserve_layout ? Color::Green : Color::Yellow),
+            separatorLight(),
+            text(" fast: ") | color(Color::GrayDark),
+            text(opts.disable_transcode ? "on " : "off ")
+                | color(opts.disable_transcode ? Color::Cyan1 : Color::GrayDark),
+        })
+    );
+}
+
+// ─── selector ─────────────────────────────────────────────────────────────────
+
+static bool run_selector(const fs::path& pac_path,
+                         std::vector<PartitionItem>& items,
+                         Opts& opts) {
+    auto screen = ScreenInteractive::Fullscreen();
+    int cursor = 0;
+    int scroll  = 0;
+    bool started = false;
+    std::string pac_name = pac_path.filename().string();
+
+    auto component = Renderer([&] {
+        int sel_count = 0;
+        uint64_t sel_bytes = 0;
+        for (auto& p : items) {
+            if (p.selected) { ++sel_count; sel_bytes += p.size; }
         }
-        return Key::None;
-    }
-    if (c == '\r' || c == '\n') return Key::Enter;
-    if (c == ' ') return Key::Space;
-    if (c == 'q' || c == 'Q') return Key::Quit;
-    if (c == 'a' || c == 'A') return Key::ToggleAll;
-    if (c == 'p' || c == 'P') return Key::ToggleModePreserve;
-    if (c == 'f' || c == 'F') return Key::ToggleModeFull;
-    if (c == 't' || c == 'T') return Key::ToggleTranscode;
-    if (c == 'g' || c == 'G') return Key::ToggleDebugFast;
-    if (c == 's' || c == 'S') return Key::Start;
-    if (c == 'j' || c == 'J') return Key::Down;
-    if (c == 'k' || c == 'K') return Key::Up;
-    return Key::None;
-}
 
-std::vector<PartitionItem> load_partitions(const fs::path& pac_path) {
-    auto reader_opt = upac::PacReader::open(pac_path);
-    if (!reader_opt) {
-        throw std::runtime_error("Could not open PAC file");
-    }
-    const auto& reader = *reader_opt;
+        int visible = std::max(5, Terminal::Size().dimy - 16);
+        if (cursor < scroll) scroll = cursor;
+        if (cursor >= scroll + visible) scroll = cursor - visible + 1;
 
-    upac::XmlProductConfig config;
-    if (!upac::parse_xml_config(reader.xml_config(), config)) {
-        throw std::runtime_error("Could not parse PAC XML");
-    }
+        Elements rows;
+        for (int i = scroll; i < scroll + visible && i < (int)items.size(); ++i) {
+            auto& p  = items[i];
+            bool active = i == cursor;
 
-    auto infos = reader.file_infos();
-    std::vector<PartitionItem> items;
+            auto check_sym = text(p.selected ? " ✓ " : "   ")
+                | color(p.selected ? Color::Green : Color::GrayDark);
+            auto name_elem = text(p.id);
+            if (active) name_elem = name_elem | bold;
+            auto block_elem = text(p.block.empty() ? "—" : p.block)
+                | color(Color::GrayDark) | size(WIDTH, EQUAL, 16);
+            auto size_elem  = text(human_size(p.size))
+                | color(Color::Cyan1) | size(WIDTH, EQUAL, 10);
 
-    for (const auto& fc : config.files) {
-        if (fc.id == "FDL" || fc.id == "FDL2" || fc.type == "FDL") continue;
-        PartitionItem item;
-        item.id = fc.id;
-        item.id_name = fc.id_name;
-        item.type = fc.type;
-        item.selected = fc.type.find("Erase") == std::string::npos;
+            auto row = hbox({
+                text("[") | color(Color::GrayDark),
+                check_sym,
+                text("] ") | color(Color::GrayDark),
+                name_elem | flex,
+                block_elem,
+                text("  "),
+                size_elem,
+            });
+            if (active) row = row | inverted;
+            rows.push_back(row);
+        }
 
-        for (const auto& fi : infos) {
-            std::string pac_id = fi.id;
-            pac_id.erase(std::find(pac_id.begin(), pac_id.end(), '\0'), pac_id.end());
-            if (pac_id == fc.id) {
-                item.size_bytes = fi.size;
-                break;
+        auto list_panel = window(
+            text(" Partitions ") | bold,
+            vbox({
+                vbox(std::move(rows)),
+                separatorLight(),
+                hbox({
+                    text(std::to_string(sel_count) + "/" +
+                         std::to_string(items.size()) + " selected"),
+                    text("  ·  ") | color(Color::GrayDark),
+                    text(human_size(sel_bytes)) | color(Color::Cyan1),
+                }) | color(Color::GrayLight),
+            })
+        );
+
+        auto opt_text = [](const std::string& s, bool on, Color on_col) -> Element {
+            auto e = text(s);
+            return on ? (e | bold | color(on_col)) : (e | color(Color::GrayDark));
+        };
+        auto opts_panel = window(
+            text(" Options "),
+            hbox({
+                text("Mode: ") | color(Color::GrayDark),
+                opt_text("Preserve", opts.preserve_layout,  Color::Green),
+                text("  /  ") | color(Color::GrayDark),
+                opt_text("Full",     !opts.preserve_layout, Color::Yellow),
+                text("   "),
+                separatorLight(),
+                text("  Fast: ")  | color(Color::GrayDark),
+                opt_text(opts.disable_transcode ? "ON " : "off", opts.disable_transcode, Color::Cyan1),
+                text("   "),
+                separatorLight(),
+                text("  Debug: ") | color(Color::GrayDark),
+                opt_text(opts.debug_fast_lane ? "ON" : "off", opts.debug_fast_lane, Color::Yellow),
+            })
+        );
+
+        auto hints = hbox({
+            text("↑↓") | color(Color::Cyan1), text("/jk nav  "),
+            text("space") | color(Color::Cyan1), text(" toggle  "),
+            text("a") | color(Color::Cyan1), text(" all  "),
+            text("p/f") | color(Color::Cyan1), text(" mode  "),
+            text("t") | color(Color::Cyan1), text(" fast  "),
+            text("g") | color(Color::Cyan1), text(" debug  "),
+            text("enter") | color(Color::Green) | bold, text(" start  "),
+            text("q") | color(Color::Red), text(" quit"),
+        }) | color(Color::GrayDark);
+
+        return vbox({
+            make_header(pac_name, opts),
+            list_panel,
+            opts_panel,
+            hints,
+        });
+    });
+
+    component = CatchEvent(component, [&](Event e) -> bool {
+        if (e == Event::ArrowUp    || e == Event::Character('k')) {
+            if (cursor > 0) --cursor; return true;
+        }
+        if (e == Event::ArrowDown  || e == Event::Character('j')) {
+            if (cursor + 1 < (int)items.size()) ++cursor; return true;
+        }
+        if (e == Event::Character(' ')) {
+            items[cursor].selected = !items[cursor].selected; return true;
+        }
+        if (e == Event::Character('a') || e == Event::Character('A')) {
+            bool any_off = std::any_of(items.begin(), items.end(),
+                                       [](auto& p) { return !p.selected; });
+            for (auto& p : items) p.selected = any_off;
+            return true;
+        }
+        if (e == Event::Character('p') || e == Event::Character('P')) { opts.preserve_layout = true;  return true; }
+        if (e == Event::Character('f') || e == Event::Character('F')) { opts.preserve_layout = false; return true; }
+        if (e == Event::Character('t') || e == Event::Character('T')) { opts.disable_transcode = !opts.disable_transcode; return true; }
+        if (e == Event::Character('g') || e == Event::Character('G')) { opts.debug_fast_lane = !opts.debug_fast_lane; return true; }
+        if (e == Event::Return || e == Event::Character('s') || e == Event::Character('S')) {
+            if (std::any_of(items.begin(), items.end(), [](auto& p) { return p.selected; })) {
+                started = true;
+                screen.ExitLoopClosure()();
             }
+            return true;
         }
-        items.push_back(std::move(item));
-    }
-
-    return items;
-}
-
-void render_selector(const fs::path& pac_path, const std::vector<PartitionItem>& items, size_t cursor, size_t scroll, const SessionConfig& config) {
-    ScreenSize sz = get_screen_size();
-    const int header_lines = 8;
-    const int footer_lines = 4;
-    const int visible_rows = std::max(5, sz.rows - header_lines - footer_lines);
-    const int content_width = std::min(110, std::max(60, sz.cols - 2));
-    const int size_w = 10;
-    const int type_w = content_width >= 110 ? 14 : 10;
-    const int block_w = content_width >= 95 ? 16 : 12;
-    const int part_w = std::max(18, content_width - size_w - type_w - block_w - 6);
-
-    size_t selected_count = 0;
-    for (const auto& item : items) if (item.selected) ++selected_count;
-
-    std::ostringstream out;
-    out << "\x1b[2J\x1b[H";
-    out << "\x1b[48;5;236m \x1b[1;38;5;81muflash-tui\x1b[0m  "
-        << fit_text(pac_path.filename().string(), std::max(20, sz.cols - 24)) << "\n";
-    out << " Mode: " << (config.flash_mode == FlashMode::Preserve ? "\x1b[38;5;120mpreserve-layout\x1b[0m" : "\x1b[38;5;214mfull-flash\x1b[0m")
-        << "   Fast mode: " << (config.disable_transcode ? "\x1b[38;5;45mon\x1b[0m" : "\x1b[38;5;244moff\x1b[0m")
-        << "   Fast debug: " << (config.debug_fast_lane ? "\x1b[38;5;208mon\x1b[0m" : "\x1b[38;5;244moff\x1b[0m")
-        << "   Selected: " << selected_count << "/" << items.size() << "\n";
-    out << " Move: j/k or arrows   Toggle: space   Start: enter/s   Quit: q\n";
-    out << " Actions: a all   p preserve   f full   t fast   g fast-debug\n";
-    out << std::string(std::max(0, content_width), '=') << "\n";
-    out << pad_right("Partition", part_w)
-        << "  " << pad_right("Block", block_w)
-        << "  " << pad_right("Type", type_w)
-        << "  " << pad_right("Size", size_w) << "\n";
-    out << std::string(std::max(0, content_width), '-') << "\n";
-
-    for (int row = 0; row < visible_rows; ++row) {
-        size_t idx = scroll + static_cast<size_t>(row);
-        if (idx >= items.size()) {
-            out << "\n";
-            continue;
+        if (e == Event::Character('q') || e == Event::Character('Q')) {
+            screen.ExitLoopClosure()();
+            return true;
         }
-        const auto& item = items[idx];
-        bool active = idx == cursor;
-        if (active) out << "\x1b[48;5;238m\x1b[38;5;255m";
-        std::ostringstream left;
-        left << (item.selected ? "[x] " : "[ ] ");
-        if (active) left << "> ";
-        else left << "  ";
-        left << item.id;
-        out << pad_right(left.str(), part_w)
-            << "  " << pad_right(item.id_name.empty() ? "-" : item.id_name, block_w)
-            << "  " << pad_right(item.type, type_w)
-            << "  " << pad_right(item.size_bytes ? human_mib(item.size_bytes) : "-", size_w);
-        if (active) out << "\x1b[0m";
-        out << "\n";
-    }
+        return false;
+    });
 
-    out << std::string(std::max(0, content_width), '=') << "\n";
-    out << "Press enter to start flashing the selected partitions.\n";
-    std::cout << out.str() << std::flush;
+    screen.Loop(component);
+    return started;
 }
 
-std::string render_bar(int width, int percent) {
-    width = std::max(10, width);
-    int filled = (width * std::max(0, std::min(percent, 100))) / 100;
-    return std::string(filled, '#') + std::string(width - filled, '-');
-}
+// ─── flash screen ─────────────────────────────────────────────────────────────
 
-void push_log(std::deque<std::string>& logs, const std::string& line, size_t max_lines) {
-    logs.push_back(line);
-    while (logs.size() > max_lines) logs.pop_front();
-}
+static int run_flash(const fs::path& exe, const fs::path& pac_path,
+                     const std::vector<PartitionItem>& items, const Opts& opts) {
+    // Build argv
+    std::vector<std::string> arg_strs;
+    arg_strs.push_back(exe.string());
+    arg_strs.push_back(pac_path.string());
+    arg_strs.push_back(opts.preserve_layout ? "--preserve-layout" : "--full-flash");
+    if (opts.disable_transcode) arg_strs.push_back("--disable-transcode");
+    if (opts.debug_fast_lane)   arg_strs.push_back("--debug-fast-lane");
+    for (auto& p : items)
+        if (p.selected) { arg_strs.push_back("--partition"); arg_strs.push_back(p.id); }
+    std::vector<char*> argv_v;
+    for (auto& s : arg_strs) argv_v.push_back(s.data());
+    argv_v.push_back(nullptr);
 
-void render_flash(const fs::path& pac_path, const SessionConfig& config, const FlashProgress& progress) {
-    ScreenSize sz = get_screen_size();
-    int log_lines = std::max(8, sz.rows - 10);
-    const int content_width = std::min(110, std::max(60, sz.cols - 2));
-    std::ostringstream out;
-    out << "\x1b[2J\x1b[H";
-    out << "\x1b[1;38;5;81muflash-tui\x1b[0m  running " << fit_text(pac_path.filename().string(), content_width - 18) << "\n";
-    out << "Mode: " << (config.flash_mode == FlashMode::Preserve ? "preserve-layout" : "full-flash")
-        << "   Fast mode: " << (config.disable_transcode ? "on" : "off")
-        << "   Fast debug: " << (config.debug_fast_lane ? "on" : "off") << "\n";
-    out << "Current: " << (progress.current_partition.empty() ? "(starting)" : progress.current_partition) << "\n";
-    out << "[" << render_bar(std::max(20, content_width - 8), progress.percent) << "] " << progress.percent << "%\n";
-    if (!progress.detail.empty()) out << fit_text(progress.detail, content_width) << "\n";
-    out << std::string(std::max(0, content_width), '-') << "\n";
-
-    int skip = std::max(0, static_cast<int>(progress.logs.size()) - log_lines);
-    for (int i = skip; i < static_cast<int>(progress.logs.size()); ++i) {
-        out << fit_text(progress.logs[i], content_width) << "\n";
-    }
-
-    if (progress.finished) {
-        out << std::string(std::max(0, content_width), '-') << "\n";
-        out << (progress.exit_code == 0 ? "Flash process finished successfully. Press q to exit." :
-                                          "Flash process exited with errors. Press q to exit.") << "\n";
-    }
-
-    std::cout << out.str() << std::flush;
-}
-
-void parse_flash_line(const std::string& line, FlashProgress& progress) {
-    static const std::regex part_re("^\\[([^\\]]+)\\]");
-    static const std::regex prog_re("Progress: ([0-9]+)%");
-    std::smatch match;
-
-    if (std::regex_search(line, match, part_re)) {
-        progress.current_partition = match[1];
-    }
-    if (std::regex_search(line, match, prog_re)) {
-        progress.percent = std::stoi(match[1]);
-        progress.detail = line;
-    } else if (!line.empty()) {
-        progress.detail = line;
-    }
-}
-
-int run_child_flash(const fs::path& exe_path, const fs::path& pac_path, const std::vector<PartitionItem>& items, const SessionConfig& config) {
     int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        std::perror("pipe");
-        return 1;
-    }
-
-    std::vector<std::string> args;
-    args.push_back(exe_path.string());
-    args.push_back(pac_path.string());
-    args.push_back(config.flash_mode == FlashMode::Preserve ? "--preserve-layout" : "--full-flash");
-    if (config.disable_transcode) args.push_back("--disable-transcode");
-    if (config.debug_fast_lane) args.push_back("--debug-fast-lane");
-    for (const auto& item : items) {
-        if (item.selected) {
-            args.push_back("--partition");
-            args.push_back(item.id);
-        }
-    }
-
-    std::vector<char*> argv;
-    argv.reserve(args.size() + 1);
-    for (auto& arg : args) argv.push_back(arg.data());
-    argv.push_back(nullptr);
+    if (pipe(pipefd) != 0) return 1;
 
     pid_t pid = fork();
     if (pid == 0) {
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[0]);
-        close(pipefd[1]);
-        execv(argv[0], argv.data());
+        close(pipefd[0]); close(pipefd[1]);
+        execv(argv_v[0], argv_v.data());
         _exit(127);
     }
-
     close(pipefd[1]);
     fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
 
-    FlashProgress progress;
-    std::string buffer;
-    TerminalGuard raw_guard;
-    raw_guard.enable_raw();
-    AltScreenGuard screen_guard;
+    FlashState st;
+    std::atomic<size_t> frame{0};
+    std::atomic<bool>   all_done{false};
+    std::string pac_name = pac_path.filename().string();
+    auto screen = ScreenInteractive::Fullscreen();
 
-    while (!progress.finished) {
-        char tmp[4096];
-        ssize_t n = read(pipefd[0], tmp, sizeof(tmp));
-        if (n > 0) {
-            buffer.append(tmp, static_cast<size_t>(n));
-            size_t pos = 0;
-            while ((pos = buffer.find('\n')) != std::string::npos) {
-                std::string line = buffer.substr(0, pos);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                push_log(progress.logs, line, 200);
-                parse_flash_line(line, progress);
-                buffer.erase(0, pos + 1);
+    // I/O reader thread — reads child stdout/stderr into st.log
+    std::thread io_thread([&] {
+        std::string buf;
+        while (true) {
+            char tmp[4096];
+            ssize_t n = ::read(pipefd[0], tmp, sizeof(tmp));
+            if (n > 0) {
+                buf.append(tmp, static_cast<size_t>(n));
+                size_t pos;
+                while ((pos = buf.find('\n')) != std::string::npos) {
+                    auto line = buf.substr(0, pos);
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    buf.erase(0, pos + 1);
+                    {
+                        std::lock_guard<std::mutex> lk(st.mtx);
+                        st.log.push_back(line);
+                        if (st.log.size() > 300) st.log.pop_front();
+                        parse_flash_line(line, st);
+                    }
+                    screen.PostEvent(Event::Custom);
+                }
+            } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                break;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(8));
             }
         }
+    });
 
+    // Reaper thread — waits for child, marks done
+    std::thread wait_thread([&] {
         int status = 0;
-        pid_t done = waitpid(pid, &status, WNOHANG);
-        if (done == pid) {
-            progress.finished = true;
-            progress.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-            if (!buffer.empty()) {
-                push_log(progress.logs, buffer, 200);
-                parse_flash_line(buffer, progress);
-                buffer.clear();
-            }
+        waitpid(pid, &status, 0);
+        {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            st.done      = true;
+            st.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
+        all_done = true;
+        screen.PostEvent(Event::Custom);
+    });
+
+    // Animation tick thread — drives spinner + periodic redraws
+    std::thread anim_thread([&] {
+        while (!all_done) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            ++frame;
+            screen.PostEvent(Event::Custom);
+        }
+    });
+
+    auto component = Renderer([&] {
+        std::lock_guard<std::mutex> lk(st.mtx);
+
+        // ── spinner + current partition ──────────────────────────────────────
+        Element status_elem;
+        if (!st.done) {
+            status_elem = hbox({
+                spinner(3, frame) | color(Color::Cyan1),
+                text("  Flashing: ") | color(Color::GrayDark),
+                text(st.partition.empty() ? "(connecting…)" : st.partition)
+                    | bold | color(Color::White),
+            });
+        } else if (st.exit_code == 0) {
+            status_elem = hbox({
+                text(" ✓ ") | bold | color(Color::Green),
+                text("Flash complete") | bold | color(Color::Green),
+                text("  —  press ") | color(Color::GrayDark),
+                text("q") | color(Color::Cyan1),
+                text(" to exit") | color(Color::GrayDark),
+            });
+        } else {
+            status_elem = hbox({
+                text(" ✗ ") | bold | color(Color::Red),
+                text("Flash failed (exit " + std::to_string(st.exit_code) + ")")
+                    | bold | color(Color::Red),
+                text("  —  press ") | color(Color::GrayDark),
+                text("q") | color(Color::Cyan1),
+                text(" to exit") | color(Color::GrayDark),
+            });
         }
 
-        render_flash(pac_path, config, progress);
-        Key key = read_key();
-        if (progress.finished && key == Key::Quit) break;
-        usleep(30000);
-    }
+        // ── progress gauge ───────────────────────────────────────────────────
+        float frac = float(std::max(0, std::min(st.percent, 100))) / 100.0f;
+        Color bar_col = st.done
+            ? (st.exit_code == 0 ? Color::Green : Color::Red)
+            : Color::Cyan1;
+        auto gauge_row = hbox({
+            gauge(frac) | flex | color(bar_col),
+            text(" " + std::to_string(st.percent) + "%") | bold,
+        });
 
+        // ── stats line ───────────────────────────────────────────────────────
+        std::ostringstream stats;
+        if (st.mib_total > 0.0) {
+            stats << std::fixed << std::setprecision(1)
+                  << st.mib_done << " / " << st.mib_total << " MiB";
+            if (st.speed > 0.1) {
+                stats << "  ·  " << std::setprecision(1) << st.speed << " MiB/s";
+                double rem_s = (st.mib_total - st.mib_done) / st.speed;
+                int eta = static_cast<int>(rem_s);
+                if (eta > 0) {
+                    stats << "  ·  ETA ";
+                    if (eta >= 60) stats << (eta / 60) << "m ";
+                    stats << (eta % 60) << "s";
+                }
+            }
+        }
+        auto stats_elem = text(stats.str()) | color(Color::GrayDark);
+
+        auto progress_panel = window(
+            text(" Progress ") | bold,
+            vbox({ status_elem, gauge_row, stats_elem })
+        );
+
+        // ── log panel ────────────────────────────────────────────────────────
+        int log_visible = std::max(5, Terminal::Size().dimy - 14);
+        int skip = std::max(0, (int)st.log.size() - log_visible);
+        Elements log_rows;
+        for (int i = skip; i < (int)st.log.size(); ++i) {
+            const auto& ln = st.log[i];
+            Color c = Color::Default;
+            if (ln.find("error") != std::string::npos
+                || ln.find("Error") != std::string::npos
+                || ln.find("failed") != std::string::npos)
+                c = Color::Red;
+            else if (ln.find("warning") != std::string::npos
+                     || ln.find("Warning") != std::string::npos)
+                c = Color::Yellow;
+            else if (ln.find("OK") != std::string::npos
+                     || ln.find("complete") != std::string::npos)
+                c = Color::Green;
+            else if (ln.find("Progress:") != std::string::npos)
+                c = Color::Cyan1;
+            auto display = ln.size() > 200 ? ln.substr(0, 200) + "…" : ln;
+            log_rows.push_back(text(display) | color(c));
+        }
+        if (log_rows.empty()) log_rows.push_back(text("(waiting for output…)") | color(Color::GrayDark));
+
+        auto log_panel = window(text(" Log "), vbox(std::move(log_rows)));
+
+        return vbox({
+            make_header(pac_name, opts),
+            progress_panel,
+            log_panel,
+        });
+    });
+
+    component = CatchEvent(component, [&](Event e) -> bool {
+        if (e == Event::Character('q') || e == Event::Character('Q')) {
+            std::lock_guard<std::mutex> lk(st.mtx);
+            if (st.done) { screen.ExitLoopClosure()(); return true; }
+        }
+        return false;
+    });
+
+    screen.Loop(component);
+
+    all_done = true;
     close(pipefd[0]);
-    return progress.exit_code;
+    anim_thread.join();
+    io_thread.join();
+    wait_thread.join();
+
+    std::lock_guard<std::mutex> lk(st.mtx);
+    return st.exit_code;
 }
 
-} // namespace
+// ─── main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
     if (argc < 2 || std::string(argv[1]) == "--help") {
@@ -429,69 +490,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    SessionConfig config;
-    TerminalGuard raw_guard;
-    if (!raw_guard.enable_raw()) {
-        std::cerr << "error: could not enable raw terminal mode\n";
-        return 1;
-    }
-    AltScreenGuard screen_guard;
+    Opts opts;
+    if (!run_selector(pac_path, items, opts)) return 0;
 
-    size_t cursor = 0;
-    size_t scroll = 0;
-
-    while (true) {
-        ScreenSize sz = get_screen_size();
-        int visible_rows = std::max(5, sz.rows - 11);
-        if (cursor < scroll) scroll = cursor;
-        if (cursor >= scroll + static_cast<size_t>(visible_rows)) scroll = cursor - static_cast<size_t>(visible_rows) + 1;
-
-        render_selector(pac_path, items, cursor, scroll, config);
-        Key key = read_key();
-        switch (key) {
-            case Key::Up:
-                if (cursor > 0) --cursor;
-                break;
-            case Key::Down:
-                if (cursor + 1 < items.size()) ++cursor;
-                break;
-            case Key::Space:
-                items[cursor].selected = !items[cursor].selected;
-                break;
-            case Key::ToggleAll: {
-                bool any_unselected = std::any_of(items.begin(), items.end(), [](const auto& item) { return !item.selected; });
-                for (auto& item : items) item.selected = any_unselected;
-                break;
-            }
-            case Key::ToggleModePreserve:
-                config.flash_mode = FlashMode::Preserve;
-                break;
-            case Key::ToggleModeFull:
-                config.flash_mode = FlashMode::Full;
-                break;
-            case Key::ToggleTranscode:
-                config.disable_transcode = !config.disable_transcode;
-                break;
-            case Key::ToggleDebugFast:
-                config.debug_fast_lane = !config.debug_fast_lane;
-                break;
-            case Key::Enter:
-            case Key::Start: {
-                size_t selected = 0;
-                for (const auto& item : items) if (item.selected) ++selected;
-                if (selected == 0) break;
-                raw_guard.disable_raw();
-                fs::path exe_path = fs::absolute(argv[0]).parent_path() / "uflash";
-                int exit_code = run_child_flash(exe_path, pac_path, items, config);
-                return exit_code;
-            }
-            case Key::Quit:
-                return 0;
-            case Key::None:
-            case Key::Left:
-            case Key::Right:
-                break;
-        }
-        usleep(16000);
-    }
+    fs::path exe = fs::absolute(argv[0]).parent_path() / "uflash";
+    return run_flash(exe, pac_path, items, opts);
 }
