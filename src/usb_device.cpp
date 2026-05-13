@@ -50,7 +50,17 @@ std::optional<EndpointSelection> find_bulk_endpoints(const libusb_config_descrip
 }
 
 bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSelection& selection) {
+    // Enable auto-detach so libusb handles driver detachment on claim_interface.
     libusb_set_auto_detach_kernel_driver(handle, 1);
+
+    // Explicitly detach any kernel driver (e.g. cdc_acm that Linux loads
+    // automatically on some composite USB devices).  LIBUSB_ERROR_NOT_FOUND
+    // means no driver was bound — that is fine.  Auto-detach alone is
+    // unreliable on older kernels; both are needed for robustness.
+    int dr = libusb_detach_kernel_driver(handle, selection.interface_number);
+    if (dr != 0 && dr != LIBUSB_ERROR_NOT_FOUND && dr != LIBUSB_ERROR_NOT_SUPPORTED) {
+        std::cerr << "usb: detach kernel driver returned " << libusb_error_name(dr) << "\n";
+    }
 
     int active_config = 0;
     if (libusb_get_configuration(handle, &active_config) == 0 && active_config != 1) {
@@ -59,20 +69,27 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
         }
     }
 
-    if (libusb_claim_interface(handle, selection.interface_number) != 0) {
+    int cr = libusb_claim_interface(handle, selection.interface_number);
+    if (cr != 0) {
+        std::cerr << "usb: claim interface " << selection.interface_number
+                  << " failed: " << libusb_error_name(cr) << "\n";
         return false;
     }
 
-    // Always issue SET_INTERFACE even for altsetting 0.  On Linux, this is
-    // required to load the endpoint descriptors into the kernel's URB state
-    // machine; skipping it causes the first bulk transfer to return
-    // LIBUSB_ERROR_TIMEOUT on some kernels even though the endpoint is valid.
-    libusb_set_interface_alt_setting(handle,
-                                     selection.interface_number,
-                                     selection.alt_setting);
+    // DO NOT send SET_INTERFACE here.  The Unisoc BROM implements only the
+    // minimum USB control requests (GET_DESCRIPTOR, SET_ADDRESS,
+    // SET_CONFIGURATION).  Sending SET_INTERFACE causes the BROM to stall or
+    // enter an error state on some chip variants, after which the bulk OUT
+    // endpoint stops ACKing data and every write returns LIBUSB_ERROR_TIMEOUT.
+    // Only send it for non-zero alt settings where it is actually required.
+    if (selection.alt_setting > 0) {
+        libusb_set_interface_alt_setting(handle,
+                                         selection.interface_number,
+                                         selection.alt_setting);
+    }
 
-    // Give the kernel driver handoff time to complete before the first transfer.
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // Give kernel driver handoff and any BROM-side USB re-init time to settle.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     return true;
 }
 
