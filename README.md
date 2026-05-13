@@ -23,6 +23,9 @@ cmake ..
 make -j8
 ```
 
+Linux note:
+`uflash` talks to the device through `libusb`, so production installs should either run with elevated privileges or ship a udev rule that grants access to Unisoc bootrom devices such as `1782:4d00`.
+
 ## Usage
 
 ```bash
@@ -96,3 +99,4 @@ make -j8
 - **0xFE Repartition Rejection**: If `ExecNandInit` returns `0xFE`, it typically indicates that `szID1` and `szID2` are unsynchronized in the partition schema, or the `userdata` size isn't set to auto-fill (`0x00` size) for modern FDL2s.
 - **Named Downloads**: File downloads directed at `0x00` base addresses require `DownloadByID`. `uflash` will automatically pad out unaligned named-download trails (e.g. `gnssmodem.bin`) to prevent CRC timeouts.
 - **The Fast Lane (`DA_INFO_T`)**: For `disable-transcode` to work, the `uflash` protocol engine parses the hidden `DA_INFO_T` struct returned by modern Unisoc BootROMs (even on failure packets) to toggle the `bDisableTransCode` flag.
+- **Linux Transport Robustness**: The USB transport now retains its own `libusb` context, scans all alternate settings for bulk endpoints, and claims the discovered interface before the first handshake. This is important because Linux tends to be less forgiving than macOS when the active configuration or interface selection is wrong.

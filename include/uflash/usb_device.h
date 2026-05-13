@@ -24,7 +24,11 @@ public:
 
     static std::optional<std::unique_ptr<UsbDevice>> find_any();
 
-    UsbDevice(libusb_device_handle *handle, uint8_t endpoint_in, uint8_t endpoint_out, int interface);
+    UsbDevice(libusb_context* ctx,
+              libusb_device_handle* handle,
+              uint8_t endpoint_in,
+              uint8_t endpoint_out,
+              int interface);
     ~UsbDevice();
 
     // Prevent copying

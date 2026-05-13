@@ -54,7 +54,7 @@ namespace {
         return out.str();
     }
 
-    bool maybe_parse_da_info(uint16_t type, const std::vector<uint8_t>& payload, bool& transcode_supported) {
+    bool maybe_parse_da_info(const std::vector<uint8_t>& payload, bool& transcode_supported) {
         // Vendor DA_INFO_T is surfaced on some replies, most importantly the
         // 0x96 / 0xFE incompatible-partition reply from ExecNandInit. Version 1 uses
         // the first 8 bytes; later FDLs may return larger versioned variants,
@@ -248,7 +248,7 @@ bool BslProtocol::receive_packet(uint16_t& out_type, std::vector<uint8_t>& out_p
                                 uint16_t computed_sum = bsl_checksum(buffer.data(), 4 + len);
                                 bool ok = stored_check == computed_crc || stored_check == computed_sum;
                                 if (ok) {
-                                    maybe_parse_da_info(out_type, out_payload, transcode_supported_);
+                                    maybe_parse_da_info(out_payload, transcode_supported_);
                                 }
                                 if (debug_protocol_) {
                                     std::cout << "bsl: rx type=0x" << std::hex << out_type << std::dec
@@ -305,7 +305,7 @@ bool BslProtocol::receive_packet(uint16_t& out_type, std::vector<uint8_t>& out_p
                         
                         bool ok = stored_check == computed_crc || stored_check == computed_sum;
                         if (ok) {
-                            maybe_parse_da_info(out_type, out_payload, transcode_supported_);
+                            maybe_parse_da_info(out_payload, transcode_supported_);
                         }
                         if (debug_protocol_) {
                             std::cout << "bsl: rx type=0x" << std::hex << out_type << std::dec

@@ -1,23 +1,111 @@
 #include "uflash/usb_device.h"
-#include <iostream>
+
 #include <algorithm>
-#include <cstring>
-#include <thread>
 #include <chrono>
+#include <cstring>
+#include <iostream>
+#include <thread>
 
 namespace uflash {
+namespace {
 
 static constexpr uint16_t SPD_VID = 0x1782;
 static constexpr uint16_t SPD_PIDS[] = { 0x4d00, 0x5d00, 0x3d00 };
 
-UsbDevice::UsbDevice(libusb_device_handle* handle, uint8_t in, uint8_t out, int interface)
-    : handle_(handle), ep_in_(in), ep_out_(out), interface_(interface) {
+bool is_supported_pid(uint16_t pid) {
+    return std::find(std::begin(SPD_PIDS), std::end(SPD_PIDS), pid) != std::end(SPD_PIDS);
 }
 
+struct EndpointSelection {
+    uint8_t ep_in = 0;
+    uint8_t ep_out = 0;
+    int interface_number = -1;
+    int alt_setting = -1;
+};
+
+std::optional<EndpointSelection> find_bulk_endpoints(const libusb_config_descriptor& config) {
+    for (uint8_t iface_index = 0; iface_index < config.bNumInterfaces; ++iface_index) {
+        const libusb_interface& intf = config.interface[iface_index];
+        for (int alt_index = 0; alt_index < intf.num_altsetting; ++alt_index) {
+            const libusb_interface_descriptor& alt = intf.altsetting[alt_index];
+            uint8_t ep_in = 0;
+            uint8_t ep_out = 0;
+            for (uint8_t endpoint_index = 0; endpoint_index < alt.bNumEndpoints; ++endpoint_index) {
+                const libusb_endpoint_descriptor& ep = alt.endpoint[endpoint_index];
+                if ((ep.bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) != LIBUSB_TRANSFER_TYPE_BULK) {
+                    continue;
+                }
+                if ((ep.bEndpointAddress & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN) {
+                    ep_in = ep.bEndpointAddress;
+                } else {
+                    ep_out = ep.bEndpointAddress;
+                }
+            }
+            if (ep_in != 0 && ep_out != 0) {
+                return EndpointSelection{ep_in, ep_out, alt.bInterfaceNumber, alt.bAlternateSetting};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSelection& selection) {
+    libusb_set_auto_detach_kernel_driver(handle, 1);
+
+    int active_config = 0;
+    if (libusb_get_configuration(handle, &active_config) == 0 && active_config <= 0) {
+        if (libusb_set_configuration(handle, 1) != 0) {
+            return false;
+        }
+    }
+
+    int claim_result = libusb_claim_interface(handle, selection.interface_number);
+    if (claim_result != 0) {
+        return false;
+    }
+
+    if (selection.alt_setting > 0) {
+        int alt_result = libusb_set_interface_alt_setting(handle,
+                                                          selection.interface_number,
+                                                          selection.alt_setting);
+        if (alt_result != 0) {
+            libusb_release_interface(handle, selection.interface_number);
+            return false;
+        }
+    }
+
+    // Some implementations expose a CDC-style control interface and expect DTR/RTS
+    // to be asserted before the bootrom starts draining the bulk endpoints.
+    libusb_control_transfer(handle,
+                            0x21,
+                            34,
+                            0x03,
+                            static_cast<uint16_t>(selection.interface_number),
+                            nullptr,
+                            0,
+                            1000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    return true;
+}
+
+} // namespace
+
+UsbDevice::UsbDevice(libusb_context* ctx,
+                     libusb_device_handle* handle,
+                     uint8_t in,
+                     uint8_t out,
+                     int interface)
+    : ctx_(ctx), handle_(handle), ep_in_(in), ep_out_(out), interface_(interface) {}
+
 UsbDevice::~UsbDevice() {
-    if (handle_) {
-        libusb_release_interface(handle_, interface_);
+    if (handle_ != nullptr) {
+        if (interface_ >= 0) {
+            libusb_release_interface(handle_, interface_);
+        }
         libusb_close(handle_);
+    }
+    if (ctx_ != nullptr) {
+        libusb_exit(ctx_);
     }
 }
 
@@ -26,108 +114,73 @@ void UsbDevice::reset() {
 }
 
 std::optional<std::unique_ptr<UsbDevice>> UsbDevice::find_any() {
-    if (libusb_init(nullptr) < 0) return std::nullopt;
+    libusb_context* ctx = nullptr;
+    if (libusb_init(&ctx) < 0) {
+        return std::nullopt;
+    }
 
     libusb_device** devs;
-    ssize_t count = libusb_get_device_list(nullptr, &devs);
-    if (count < 0) return std::nullopt;
+    ssize_t count = libusb_get_device_list(ctx, &devs);
+    if (count < 0) {
+        libusb_exit(ctx);
+        return std::nullopt;
+    }
 
     libusb_device_handle* found_handle = nullptr;
-    uint8_t found_in = 0, found_out = 0;
-    int best_interface = -1;
+    EndpointSelection found_selection;
 
     for (ssize_t i = 0; i < count; ++i) {
         libusb_device_descriptor desc;
-        if (libusb_get_device_descriptor(devs[i], &desc) < 0) continue;
+        if (libusb_get_device_descriptor(devs[i], &desc) < 0) {
+            continue;
+        }
+        if (desc.idVendor != SPD_VID || !is_supported_pid(desc.idProduct)) {
+            continue;
+        }
 
-        bool match = false;
-        if (desc.idVendor == SPD_VID) {
-            for (auto pid : SPD_PIDS) {
-                if (desc.idProduct == pid) {
-                    match = true;
-                    break;
-                }
+        libusb_config_descriptor* config = nullptr;
+        if (libusb_get_active_config_descriptor(devs[i], &config) != 0) {
+            if (libusb_get_config_descriptor(devs[i], 0, &config) != 0) {
+                continue;
             }
         }
 
-        if (match) {
-            if (libusb_open(devs[i], &found_handle) == 0) {
-                // Explicitly set configuration 1
-                libusb_set_configuration(found_handle, 1);
-
-                libusb_config_descriptor* config;
-                libusb_get_config_descriptor(devs[i], 0, &config);
-                
-                bool endpoints_found = false;
-                for (int j = 0; j < config->bNumInterfaces; ++j) {
-                    const libusb_interface* intf = &config->interface[j];
-                    const libusb_interface_descriptor* alt = &intf->altsetting[0];
-                    
-                    std::cout << "  Interface " << j << " (Class=0x" << std::hex << (int)alt->bInterfaceClass 
-                              << ", SubClass=0x" << (int)alt->bInterfaceSubClass << std::dec << ") has " 
-                              << (int)alt->bNumEndpoints << " endpoints\n";
-                    for (int e = 0; e < alt->bNumEndpoints; ++e) {
-                         auto& ep = alt->endpoint[e];
-                         std::cout << "    EP 0x" << std::hex << (int)ep.bEndpointAddress 
-                                   << " Type=" << (int)(ep.bmAttributes & 0x03) << std::dec << "\n";
-                    }
-
-                    uint8_t tmp_in = 0, tmp_out = 0;
-                    for (int e = 0; e < alt->bNumEndpoints; ++e) {
-                        auto& ep = alt->endpoint[e];
-                        if ((ep.bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) == LIBUSB_TRANSFER_TYPE_BULK) {
-                            if (ep.bEndpointAddress & LIBUSB_ENDPOINT_IN) tmp_in = ep.bEndpointAddress;
-                            else tmp_out = ep.bEndpointAddress;
-                        }
-                    }
-
-                    if (tmp_in && tmp_out) {
-                        libusb_set_auto_detach_kernel_driver(found_handle, 1);
-                        
-                        int current_cfg = 0;
-                        libusb_get_configuration(found_handle, &current_cfg);
-                        if (current_cfg != 1) {
-                            libusb_set_configuration(found_handle, 1);
-                        }
-
-                        if (libusb_claim_interface(found_handle, j) == 0) {
-                            std::cout << "Found Unisoc Device [ " 
-                                      << std::hex << desc.idVendor << ":" << desc.idProduct 
-                                      << std::dec << " ] on interface " << j << "\n";
-                            std::cout << "  Endpoints: IN=0x" << std::hex << (int)tmp_in 
-                                      << ", OUT=0x" << (int)tmp_out << std::dec << "\n";
-                            
-                            libusb_set_interface_alt_setting(found_handle, j, 0);
-
-                            // Set DTR/RTS HIGH (0x03)
-                            libusb_control_transfer(found_handle, 0x21, 34, 0x03, j, nullptr, 0, 1000);
-                            
-                            // Conservative settle after claiming the interface.
-                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-                            best_interface = j;
-                            found_in = tmp_in;
-                            found_out = tmp_out;
-                            endpoints_found = true;
-                            break;
-                        }
-                    }
-                }
-                
-                libusb_free_config_descriptor(config);
-                if (endpoints_found) break;
-
-                libusb_close(found_handle);
-                found_handle = nullptr;
-            }
+        auto selection = find_bulk_endpoints(*config);
+        libusb_free_config_descriptor(config);
+        if (!selection) {
+            continue;
         }
+
+        if (libusb_open(devs[i], &found_handle) != 0) {
+            found_handle = nullptr;
+            continue;
+        }
+
+        if (!prepare_handle_for_interface(found_handle, *selection)) {
+            libusb_close(found_handle);
+            found_handle = nullptr;
+            continue;
+        }
+
+        found_selection = *selection;
+        std::cout << "Found Unisoc Device [ "
+                  << std::hex << desc.idVendor << ":" << desc.idProduct << std::dec
+                  << " ] on interface " << found_selection.interface_number << "\n";
+        std::cout << "  Endpoints: IN=0x" << std::hex << static_cast<int>(found_selection.ep_in)
+                  << ", OUT=0x" << static_cast<int>(found_selection.ep_out) << std::dec << "\n";
+        break;
     }
 
     libusb_free_device_list(devs, 1);
 
-    if (found_handle) {
-        return std::make_unique<UsbDevice>(found_handle, found_in, found_out, best_interface);
+    if (found_handle != nullptr) {
+        return std::make_unique<UsbDevice>(ctx,
+                                           found_handle,
+                                           found_selection.ep_in,
+                                           found_selection.ep_out,
+                                           found_selection.interface_number);
     }
+    libusb_exit(ctx);
     return std::nullopt;
 }
 

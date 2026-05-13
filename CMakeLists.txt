@@ -22,6 +22,7 @@ add_executable(uflash
     src/flash_workflow.cpp
     src/usb_device.cpp
     src/bsl_protocol.cpp
+    src/transfer_pipeline.cpp
 )
 
 add_executable(uflash-tui
@@ -53,3 +54,8 @@ target_link_libraries(uflash-tui
     upac_lib
     pugixml
 )
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(uflash PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(uflash-tui PRIVATE -Wall -Wextra -Wpedantic)
+endif()
