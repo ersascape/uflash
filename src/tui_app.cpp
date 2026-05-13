@@ -121,7 +121,7 @@ static Element make_header(const std::string& pac_name, const Opts& opts) {
             separatorLight(),
             text(" fast: ") | color(Color::GrayDark),
             text(opts.disable_transcode ? "on " : "off ")
-                | color(opts.disable_transcode ? Color::Cyan1 : Color::GrayDark),
+                | color(opts.disable_transcode ? Color(Color::Cyan1) : Color(Color::GrayDark)),
         })
     );
 }
@@ -389,9 +389,11 @@ static int run_flash(const fs::path& exe, const fs::path& pac_path,
 
         // ── progress gauge ───────────────────────────────────────────────────
         float frac = float(std::max(0, std::min(st.percent, 100))) / 100.0f;
+        // Explicit Color() wrapping required: Green/Red are Palette16,
+        // Cyan1 is Palette256 — the ternary common type would be int otherwise.
         Color bar_col = st.done
-            ? (st.exit_code == 0 ? Color::Green : Color::Red)
-            : Color::Cyan1;
+            ? (st.exit_code == 0 ? Color(Color::Green) : Color(Color::Red))
+            : Color(Color::Cyan1);
         auto gauge_row = hbox({
             gauge(frac) | flex | color(bar_col),
             text(" " + std::to_string(st.percent) + "%") | bold,
