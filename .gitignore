@@ -14,7 +14,7 @@ Makefile
 *.exe
 .DS_Store
 *.pac
-uflash
-uflash-tui
+/uflash
+/uflash-tui
 *.cmake
 upac-build/
