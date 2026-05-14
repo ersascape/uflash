@@ -28,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -49,11 +50,16 @@ struct Opts {
 
 struct FlashState {
     std::string partition;
-    int     percent   = 0;
-    double  speed     = 0.0;
-    double  mib_done  = 0.0;
-    double  mib_total = 0.0;
+    std::string stage     = "Connecting";
+    std::string sub_stage;
+    bool        fast_lane = false;
+    int     percent    = 0;
+    double  speed      = 0.0;
+    double  mib_done   = 0.0;
+    double  mib_total  = 0.0;
+    size_t  chunk_bytes = 0;
     std::deque<std::string> log;
+    std::unordered_set<std::string> done_partitions;
     bool done      = false;
     int  exit_code = -1;
     std::mutex mtx;
@@ -95,16 +101,71 @@ static std::vector<PartitionItem> load_partitions(const fs::path& pac_path) {
 }
 
 static void parse_flash_line(const std::string& line, FlashState& st) {
-    // Extract: [PartName] and Progress: N% (done/total MiB, speed MiB/s
-    static const std::regex part_re(R"(\[([A-Za-z0-9_\-\.]+)\])");
-    static const std::regex prog_re(R"(Progress:\s*(\d+)%\s*\(([0-9.]+)/([0-9.]+) MiB[^,]*, ([0-9.]+) MiB/s)");
+    // Partition header: "[ID] (block) Base: 0x..." — anchored to "Base:" to
+    // avoid matching [no-transcode] or other bracketed tokens.
+    static const std::regex part_hdr_re(R"(\[([A-Za-z0-9_\-\.]+)\].*Base:)");
+    // Progress: N% (x/y MiB, speed MiB/s, chunk=N)
+    static const std::regex prog_re(
+        R"(Progress:\s*(\d+)%\s*\(([0-9.]+)/([0-9.]+) MiB[^,]*, ([0-9.]+) MiB/s.*chunk=(\d+))");
+    static const std::regex prog_ok_re(R"(Progress:\s*100%\s*-\s*OK)");
+
     std::smatch m;
-    if (std::regex_search(line, m, part_re)) st.partition = m[1];
+
+    // ── stage transitions ─────────────────────────────────────────────────────
+    auto has = [&](const char* s) { return line.find(s) != std::string::npos; };
+
+    if (has("Found Unisoc Device"))                { st.stage = "Device found";   }
+    else if (has("PAC components extracted"))       { st.stage = "Unpacking";      }
+    else if (has("Sending 0x7E") || has("Sending 0xAE") || has("Handshake")) {
+                                                     st.stage = "Handshaking";    }
+    else if (has("Handshake successful") || has("Host Protocol Response")) {
+                                                     st.stage = "Handshake OK";   }
+    else if (has("Loading Stage 1") || has("FDL not detected")) {
+                                                     st.stage = "Loading FDL1";   }
+    else if (has("FDL1 is running"))                { st.stage = "FDL1 running";  }
+    else if (has("Stage 2 (FDL2)") || has("Starting Stage 2")) {
+                                                     st.stage = "Loading FDL2";   }
+    else if (has("Executing FDL2") || has("ExecNandInit")) {
+                                                     st.stage = "ExecNandInit";   }
+    else if (has("Repartition") || has("repartition")) {
+                                                     st.stage = "Repartitioning"; }
+    else if (has("Partition Flashing Phase"))        { st.stage = "Flashing";      }
+
+    // fast-lane detection
+    if (has("[no-transcode]")) st.fast_lane = true;
+
+    // ── partition header ──────────────────────────────────────────────────────
+    if (std::regex_search(line, m, part_hdr_re)) {
+        st.partition  = m[1];
+        st.percent    = 0;
+        st.mib_done   = 0.0;
+        st.mib_total  = 0.0;
+        st.speed      = 0.0;
+        st.chunk_bytes = 0;
+        st.sub_stage  = "Starting";
+        st.stage      = "Flashing";
+    }
+
+    // ── sub-stage transitions ─────────────────────────────────────────────────
+    if (has("Streaming"))                           { st.sub_stage = "Streaming";  }
+    if (has("Data transfer complete"))              { st.sub_stage = "Verifying";  }
+
+    // ── partition completion ──────────────────────────────────────────────────
+    if (std::regex_search(line, m, prog_ok_re)) {
+        if (!st.partition.empty()) st.done_partitions.insert(st.partition);
+        st.percent   = 100;
+        st.sub_stage = "Done";
+    }
+
+    // ── progress numbers ──────────────────────────────────────────────────────
     if (std::regex_search(line, m, prog_re)) {
-        st.percent   = std::stoi(m[1]);
-        st.mib_done  = std::stod(m[2]);
-        st.mib_total = std::stod(m[3]);
-        st.speed     = std::stod(m[4]);
+        st.percent     = std::stoi(m[1]);
+        st.mib_done    = std::stod(m[2]);
+        st.mib_total   = std::stod(m[3]);
+        st.speed       = std::stod(m[4]);
+        st.chunk_bytes = static_cast<size_t>(std::stoull(m[5]));
+        if (st.sub_stage != "Verifying" && st.sub_stage != "Done")
+            st.sub_stage = "Streaming";
     }
 }
 
@@ -358,16 +419,36 @@ static int run_flash(const fs::path& exe, const fs::path& pac_path,
 
     auto component = Renderer([&] {
         std::lock_guard<std::mutex> lk(st.mtx);
+        int term_h = Terminal::Size().dimy;
 
-        // ── spinner + current partition ──────────────────────────────────────
+        // ── stage + status line ──────────────────────────────────────────────
         Element status_elem;
         if (!st.done) {
-            status_elem = hbox({
-                spinner(3, frame) | color(Color::Cyan1),
-                text("  Flashing: ") | color(Color::GrayDark),
-                text(st.partition.empty() ? "(connecting…)" : st.partition)
-                    | bold | color(Color::White),
-            });
+            // Build the detail suffix: sub_stage + fast-lane + chunk size
+            Elements detail;
+            if (!st.sub_stage.empty()) {
+                detail.push_back(text("  ·  ") | color(Color::GrayDark));
+                detail.push_back(text(st.sub_stage) | color(Color::White));
+            }
+            if (st.fast_lane) {
+                detail.push_back(text("  ·  ") | color(Color::GrayDark));
+                detail.push_back(text("no-transcode") | color(Color::Cyan1));
+            }
+            if (st.chunk_bytes > 0) {
+                std::string cs = std::to_string(st.chunk_bytes / 1024) + " KB";
+                detail.push_back(text("  ·  chunk: ") | color(Color::GrayDark));
+                detail.push_back(text(cs) | color(Color::GrayLight));
+            }
+            Elements row;
+            row.push_back(spinner(3, frame) | color(Color::Cyan1));
+            row.push_back(text("  ") );
+            row.push_back(text(st.stage) | color(Color::GrayDark));
+            if (!st.partition.empty()) {
+                row.push_back(text(": ") | color(Color::GrayDark));
+                row.push_back(text(st.partition) | bold | color(Color::White));
+            }
+            for (auto& e : detail) row.push_back(e);
+            status_elem = hbox(std::move(row));
         } else if (st.exit_code == 0) {
             status_elem = hbox({
                 text(" ✓ ") | bold | color(Color::Green),
@@ -389,14 +470,14 @@ static int run_flash(const fs::path& exe, const fs::path& pac_path,
 
         // ── progress gauge ───────────────────────────────────────────────────
         float frac = float(std::max(0, std::min(st.percent, 100))) / 100.0f;
-        // Explicit Color() wrapping required: Green/Red are Palette16,
-        // Cyan1 is Palette256 — the ternary common type would be int otherwise.
+        // Explicit Color() wrapping required: Palette16 vs Palette256.
         Color bar_col = st.done
             ? (st.exit_code == 0 ? Color(Color::Green) : Color(Color::Red))
             : Color(Color::Cyan1);
         auto gauge_row = hbox({
             gauge(frac) | flex | color(bar_col),
-            text(" " + std::to_string(st.percent) + "%") | bold,
+            text(" " + std::to_string(st.percent) + "%") | bold
+                | size(WIDTH, EQUAL, 5),
         });
 
         // ── stats line ───────────────────────────────────────────────────────
@@ -422,35 +503,100 @@ static int run_flash(const fs::path& exe, const fs::path& pac_path,
             vbox({ status_elem, gauge_row, stats_elem })
         );
 
+        // ── partition list ───────────────────────────────────────────────────
+        Elements part_rows;
+        for (const auto& p : items) {
+            if (!p.selected) continue;
+            bool is_done    = st.done_partitions.count(p.id) > 0;
+            bool is_active  = !is_done && (p.id == st.partition);
+
+            Element sym;
+            if (is_done)        sym = text(" ✓ ") | color(Color::Green);
+            else if (is_active) sym = spinner(5, frame) | color(Color::Cyan1);
+            else                sym = text("   ") | color(Color::GrayDark);
+
+            auto id_elem = text(p.id)
+                | (is_active ? bold : nothing)
+                | color(is_done ? Color::GrayDark : (is_active ? Color::White : Color::GrayLight));
+
+            auto block_elem = text(p.block.empty() ? "" : "  " + p.block)
+                | color(Color::GrayDark)
+                | size(WIDTH, EQUAL, 18);
+
+            Element right;
+            if (is_done) {
+                right = text("done") | color(Color::Green) | size(WIDTH, EQUAL, 22);
+            } else if (is_active && st.mib_total > 0.0) {
+                float f = float(std::max(0, std::min(st.percent, 100))) / 100.0f;
+                std::ostringstream s;
+                s << std::fixed << std::setprecision(1) << st.speed << " MiB/s";
+                right = hbox({
+                    gauge(f) | size(WIDTH, EQUAL, 14) | color(Color::Cyan1),
+                    text(" " + std::to_string(st.percent) + "%") | bold
+                        | size(WIDTH, EQUAL, 5),
+                    text("  " + s.str()) | color(Color::GrayDark),
+                });
+            } else if (is_active) {
+                right = hbox({
+                    spinner(3, frame) | color(Color::Cyan1),
+                    text("  " + (st.sub_stage.empty() ? std::string("starting…") : st.sub_stage))
+                        | color(Color::GrayDark),
+                }) | size(WIDTH, EQUAL, 22);
+            } else {
+                right = text("pending") | color(Color::GrayDark) | size(WIDTH, EQUAL, 22);
+            }
+
+            part_rows.push_back(hbox({
+                sym,
+                id_elem | size(WIDTH, EQUAL, 20),
+                block_elem,
+                right,
+            }));
+        }
+        auto parts_panel = window(
+            text(" Partitions ") | bold,
+            part_rows.empty()
+                ? vbox({ text("(none selected)") | color(Color::GrayDark) })
+                : vbox(std::move(part_rows))
+        );
+
         // ── log panel ────────────────────────────────────────────────────────
-        int log_visible = std::max(5, Terminal::Size().dimy - 14);
+        // Give partitions list + progress about 12 rows; rest goes to log.
+        int fixed_rows = 4   // header
+                       + 5   // progress panel
+                       + 2 + static_cast<int>(
+                             std::count_if(items.begin(), items.end(),
+                                           [](const PartitionItem& p){ return p.selected; }));
+        int log_visible = std::max(3, term_h - fixed_rows - 2);
         int skip = std::max(0, (int)st.log.size() - log_visible);
         Elements log_rows;
         for (int i = skip; i < (int)st.log.size(); ++i) {
             const auto& ln = st.log[i];
+            // Skip noisy fast-lane packet debug lines from the log panel
+            if (ln.find("fast lane debug:") != std::string::npos) continue;
             Color c = Color::Default;
-            if (ln.find("error") != std::string::npos
-                || ln.find("Error") != std::string::npos
+            if (ln.find("error") != std::string::npos || ln.find("Error") != std::string::npos
                 || ln.find("failed") != std::string::npos)
                 c = Color::Red;
-            else if (ln.find("warning") != std::string::npos
-                     || ln.find("Warning") != std::string::npos)
+            else if (ln.find("warning") != std::string::npos || ln.find("Warning") != std::string::npos)
                 c = Color::Yellow;
-            else if (ln.find("OK") != std::string::npos
-                     || ln.find("complete") != std::string::npos)
+            else if (ln.find("OK") != std::string::npos || ln.find("complete") != std::string::npos
+                     || ln.find("✓") != std::string::npos)
                 c = Color::Green;
             else if (ln.find("Progress:") != std::string::npos)
                 c = Color::Cyan1;
-            auto display = ln.size() > 200 ? ln.substr(0, 200) + "…" : ln;
+            auto display = ln.size() > 120 ? ln.substr(0, 120) + "…" : ln;
             log_rows.push_back(text(display) | color(c));
         }
-        if (log_rows.empty()) log_rows.push_back(text("(waiting for output…)") | color(Color::GrayDark));
+        if (log_rows.empty())
+            log_rows.push_back(text("(waiting for output…)") | color(Color::GrayDark));
 
         auto log_panel = window(text(" Log "), vbox(std::move(log_rows)));
 
         return vbox({
             make_header(pac_name, opts),
             progress_panel,
+            parts_panel,
             log_panel,
         });
     });
