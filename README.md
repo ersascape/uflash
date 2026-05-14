@@ -1,102 +1,175 @@
-# uflash — Unisoc Flash Tool
+# uflash
 
-`uflash` is a lightweight, high-performance Unisoc flashing tool and firmware dumper built against the local `upac` PAC parsing library. It is designed to reliably navigate the Unisoc BootROM/FDL handshakes and provide robust flashing for modern devices (like the Meig SLM500S module, Android 10).
+Open-source USB flash tool for Unisoc / Spreadtrum devices. Reads standard `.pac` firmware archives and programs them over USB bulk using the BSL (Boot Serial Loader) protocol.
 
-## Key Features
+Two binaries are built:
 
-- **Protocol Support**: Understands legacy `0x7E` handshakes and modern `0xAE` Host Protocol connections.
-- **Auto-Repartitioning**: Automatically detects `0x96` or `0xFE` mismatch errors from `ExecNandInit` and dynamically generates a `BSL_CMD_REPARTITION` payload to format the `8GB+` eMMC layouts correctly.
-- **Fast Flashing (MTK Style)**: Utilizes the `BSL_CMD_DISABLE_TRANSCODE (0x21)` command to bypass HDLC byte-stuffing, unlocking massive transfer speeds (`25+ MiB/s`) for large images like `super.img`. Includes a robust 60s cooldown tolerance for heavy TLC cache flushes.
-- **Firmware Dumping**: Can read directly from the eMMC via `BSL_CMD_READ_START` to extract live partitions without needing a pre-existing scatter file.
-- **Smart NV Backup**: Safely backs up critical calibration NV partitions before repartitioning.
-- **Adaptive USB Chunking**: Modulates USB `libusb_bulk_transfer` sizes to prevent eMMC controller exhaustion, automatically gracefully backing off when FDL2 signals timeouts.
+| Binary | Description |
+|---|---|
+| `uflash` | Command-line tool — scriptable, stdout-safe |
+| `uflash-tui` | Interactive TUI (FTXUI) — partition picker + live progress gauge |
 
-## Build Requirements
+---
 
-`uflash` depends on:
-- Valid `libusb-1.0` headers
-- The local `upac` PAC library
+## Requirements
+
+| Dependency | Notes |
+|---|---|
+| C++17 compiler | GCC 9+ or Clang 10+ |
+| CMake 3.14+ | |
+| libusb-1.0 | `brew install libusb` / `apt install libusb-1.0-0-dev` |
+| [upac](../upac) | Sibling directory — PAC reader library |
+| [FTXUI](https://github.com/ArthurSonzogni/ftxui) v5 | Fetched automatically by CMake (for `uflash-tui` only) |
+
+### macOS
+
+The USB interface is held by IOKit's `AppleUSBCDCACMData` driver when the device enumerates as CDC-ACM. `uflash` calls `set_configuration(1)` to briefly evict the IOKit driver before claiming the interface, then issues `SET_CONTROL_LINE_STATE` to assert DTR+RTS — required for the BROM bulk OUT endpoint to accept data.
+
+### Linux
+
+Grant access without `sudo` via a udev rule:
+
+```
+SUBSYSTEM=="usb", ATTR{idVendor}=="1782", MODE="0666"
+```
+
+Reload: `udevadm control --reload && udevadm trigger`
+
+---
+
+## Build
 
 ```bash
 mkdir build && cd build
-cmake ..
-make -j8
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j$(nproc)
 ```
 
-Linux note:
-`uflash` talks to the device through `libusb`, so production installs should either run with elevated privileges or ship a udev rule that grants access to Unisoc bootrom devices such as `1782:4d00`.
+Both `uflash` and `uflash-tui` land in `build/`. FTXUI is fetched automatically on the first build.
 
-## Usage
+---
+
+## Entering Download Mode
+
+Hold **Vol Down** (or the board's BOOT/BROM pin) while plugging in USB. The device enumerates as VID `0x1782`, PID `0x4d00` / `0x5d00` / `0x3d00`.
+
+If FDL1/FDL2 is already running from a previous partial flash, `uflash` detects this automatically and skips straight to the flash phase.
+
+---
+
+## CLI Usage
+
+```
+uflash <firmware.pac> [options]
+```
+
+### Flash modes
+
+| Flag | Behaviour |
+|---|---|
+| *(default)* | Full flash — repartitions eMMC from PAC XML, backs up NV first |
+| `--full-flash` | Same as default, explicit |
+| `--preserve-layout` | Skips repartition; skips protected partitions (`UserData`, `fixnv*`, `prodnv`, etc.) — safe for OTA-style updates |
+
+### Partition selection
+
+| Flag | Behaviour |
+|---|---|
+| `--partition <id>` | Flash only this partition (repeatable) |
+| `--skip <id>` | Skip this partition (repeatable) |
+
+`<id>` matches against both the XML `id` field and the `id_name` / block-device name.
+
+### Transfer options
+
+| Flag | Description |
+|---|---|
+| `--disable-transcode` | Enable vendor fast-lane mode (`BSL_CMD_DISABLE_TRANSCODE`). Skips HDLC byte-stuffing — roughly 2× throughput on supported FDL2 builds |
+| `--debug-fast-lane` | Print per-packet diagnostics for the pipeline path |
+| `--debug-protocol` | Dump every BSL frame send/receive to stdout |
+
+### Other options
+
+| Flag | Description |
+|---|---|
+| `--dump-firmware <dir>` | Read all partitions from the device into `<dir>/*.bin` |
+| `--skip-nv-backup` | Skip NV backup before repartition (faster, destructive) |
+| `--fdl2-settle-ms <ms>` | Extra settle delay after FDL1 executes before the FDL2 handshake |
+| `--reset-only` | Send `BSL_CMD_NORMAL_RESET` and exit |
+| `--dump-xml` | Print the embedded PAC XML config and exit |
+| `--dump-descriptors` | Print USB descriptors of all detected Unisoc devices and exit |
+
+### Examples
 
 ```bash
-./uflash <firmware.pac> [OPTIONS]
+# Full flash (repartitions, backs up NV)
+build/uflash firmware.pac
+
+# Preserve layout + fast-lane (typical OTA update)
+build/uflash firmware.pac --preserve-layout --disable-transcode
+
+# Flash only the Super partition
+build/uflash firmware.pac --preserve-layout --disable-transcode --partition Super
+
+# Dump firmware to disk for backup
+build/uflash firmware.pac --dump-firmware ./backup
+
+# Soft-reset a device that is stuck in download mode
+build/uflash --reset-only
 ```
 
-### Core Operations
+---
 
-**Standard Full Flash:** (Will auto-repartition if needed)
+## TUI Usage
+
 ```bash
-./uflash firmware.pac
+build/uflash-tui <firmware.pac>
 ```
 
-**Force Full Flash:** (Explicitly triggers comprehensive flashing modes)
-```bash
-./uflash firmware.pac --full-flash
+Opens a full-screen partition selector, then launches `uflash` as a subprocess and renders its output as a live progress view with an animated gauge, speed, and ETA.
+
+`uflash-tui` expects the `uflash` binary to be in the same directory as itself.
+
+**Selector keys:**
+
+| Key | Action |
+|---|---|
+| `j` / `k` / `↑↓` | Navigate list |
+| `Space` | Toggle partition |
+| `a` | Toggle select-all |
+| `p` / `f` | Preserve-layout / Full-flash mode |
+| `t` | Toggle fast-lane (`--disable-transcode`) |
+| `g` | Toggle protocol debug |
+| `Enter` | Start flash |
+| `q` | Quit |
+
+---
+
+## Supported Devices
+
+Any Unisoc / Spreadtrum SoC enumerating with VID `0x1782` and PID `0x4d00`, `0x5d00`, or `0x3d00` in BROM or BSL mode. Tested on UMS512 / SC9863A based platforms.
+
+---
+
+## Project Layout
+
+```
+uflash/
+├── src/
+│   ├── main.cpp               — entry point, banner
+│   ├── cli_options.cpp        — argument parsing
+│   ├── flash_workflow.cpp     — flash orchestration, partition loop
+│   ├── bsl_protocol.cpp       — BSL framing, commands, handshake
+│   ├── usb_device.cpp         — libusb abstraction, endpoint discovery
+│   ├── transfer_pipeline.cpp  — background frame-encoder thread
+│   └── tui_app.cpp            — FTXUI interactive frontend
+├── include/uflash/
+│   ├── bsl_protocol.h
+│   ├── usb_device.h
+│   ├── transfer_pipeline.h
+│   ├── flash_workflow.h
+│   └── cli_options.h
+└── CMakeLists.txt
 ```
 
-**Preserve Current Layout:** (Skips sensitive bootloader data and avoids repartitioning)
-```bash
-./uflash firmware.pac --preserve-layout
-```
-
-**Fast Flashing Mode:** (Bypasses byte-stuffing overhead for massive performance gains)
-```bash
-./uflash firmware.pac --disable-transcode
-```
-
-### Selective Actions
-
-**Flash a Single Partition:**
-```bash
-./uflash firmware.pac --partition boot
-```
-
-**Skip Specific Partitions:**
-```bash
-./uflash firmware.pac --skip userdata --skip system
-```
-
-**Skip NV Calibration Backup:** (Useful if the partitions are already severely corrupted)
-```bash
-./uflash firmware.pac --skip-nv-backup
-```
-
-**Dump Firmware from Device:** (Extracts the device's partitions matching the PAC XML into a local folder)
-```bash
-./uflash firmware.pac --dump-firmware ./device_dump/
-```
-
-### Utility & Debugging
-
-**Restart Device in Normal Mode:**
-```bash
-./uflash --reset-only
-```
-
-**Print Embedded PAC XML:**
-```bash
-./uflash firmware.pac --dump-xml
-```
-
-**Debug FDL Timeline:**
-```bash
-./uflash firmware.pac --fdl2-settle-ms 5000     # Introduce a delay before FDL2 initiates
-./uflash firmware.pac --debug-fast-lane         # Print detailed fast-lane pipeline heuristics
-./uflash firmware.pac --debug-protocol          # Hex-dump every USB packet transmitted
-```
-
-## Notes & Findings
-- **0xFE Repartition Rejection**: If `ExecNandInit` returns `0xFE`, it typically indicates that `szID1` and `szID2` are unsynchronized in the partition schema, or the `userdata` size isn't set to auto-fill (`0x00` size) for modern FDL2s.
-- **Named Downloads**: File downloads directed at `0x00` base addresses require `DownloadByID`. `uflash` will automatically pad out unaligned named-download trails (e.g. `gnssmodem.bin`) to prevent CRC timeouts.
-- **The Fast Lane (`DA_INFO_T`)**: For `disable-transcode` to work, the `uflash` protocol engine parses the hidden `DA_INFO_T` struct returned by modern Unisoc BootROMs (even on failure packets) to toggle the `bDisableTransCode` flag.
-- **Linux Transport Robustness**: The USB transport now retains its own `libusb` context, scans all alternate settings for bulk endpoints, and claims the discovered interface before the first handshake. This is important because Linux tends to be less forgiving than macOS when the active configuration or interface selection is wrong.
+See [IMPLEMENTATION.md](IMPLEMENTATION.md) for a full description of the protocol and internal architecture.
