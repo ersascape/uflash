@@ -375,13 +375,23 @@ static int run_flash(const fs::path& exe, const fs::path& pac_path,
             if (n > 0) {
                 buf.append(tmp, static_cast<size_t>(n));
                 size_t pos;
-                while ((pos = buf.find('\n')) != std::string::npos) {
+                // Split on \r and \n so that progress lines (emitted with \r)
+                // are parsed live rather than only when the next \n arrives.
+                while ((pos = buf.find_first_of("\r\n")) != std::string::npos) {
                     auto line = buf.substr(0, pos);
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
                     buf.erase(0, pos + 1);
+                    if (line.empty()) continue;  // skip \r\n double-delimiter
                     {
                         std::lock_guard<std::mutex> lk(st.mtx);
-                        st.log.push_back(line);
+                        bool is_progress = line.find("Progress:") != std::string::npos;
+                        // Progress lines overwrite in place — keep only the latest
+                        // in the log so it doesn't flood the log panel.
+                        if (is_progress && !st.log.empty()
+                                && st.log.back().find("Progress:") != std::string::npos) {
+                            st.log.back() = line;
+                        } else {
+                            st.log.push_back(line);
+                        }
                         if (st.log.size() > 300) st.log.pop_front();
                         parse_flash_line(line, st);
                     }
