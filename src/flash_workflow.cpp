@@ -37,11 +37,11 @@ constexpr uint64_t kLargeImageThreshold = 8ULL * 1024ULL * 1024ULL; // 8 MB: use
 constexpr size_t kLargeImageNamedChunkSize = 0x10000;
 constexpr size_t kLargeImageStartChunkSize = 0x10000;
 constexpr size_t kLargeImageMinChunkSize = 0x2000;
-constexpr size_t kFastLaneWindowSize = 0x4000000; // 64 MB — sync before eMMC erase-boundary stalls accumulate
 constexpr size_t kLargeImageRecoveryDistance = 16 * 1024 * 1024;
 constexpr size_t kLargeImageProbeDistance = 256 * 1024 * 1024;
 constexpr int kDefaultEndDataTimeoutMs = 30000;
 constexpr int kLargeImageEndDataTimeoutMs = 180000;
+constexpr int kLargeImageMidstAckTimeoutMs = 120000;
 
 struct PartitionEntry {
     std::string id;
@@ -602,10 +602,16 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
             const bool large_transfer_profile = is_large_transfer_profile(buf.size(), use_named_download);
             const bool use_fast_lane = fast_mode_active && large_transfer_profile;
             const bool debug_fast_lane = debug_fast_lane_enabled && fc.id == "Super";
+            // NAND-backed partition types (modem, DSP, NV) have tighter ACK timing
+            // than eMMC.  Cap them at 32 KB to avoid the 60 s pipeline ACK timeout
+            // that triggers with 64 KB chunks.  eMMC named partitions (Super, etc.)
+            // keep the full 64 KB chunk for throughput.
+            const bool is_nand_type = (fc.type == "CODE2" || fc.type == "YAFFS_IMG2"
+                                    || fc.type == "CODE264" || fc.type == "YAFFS_IMG264");
             const size_t base_chunk_size = large_transfer_profile
-                ? kLargeImageNamedChunkSize
+                ? (is_nand_type ? 0x8000 : kLargeImageNamedChunkSize)
                 : choose_download_chunk_size(fc, buf.size());
-            size_t chunk_size = large_transfer_profile ? kLargeImageStartChunkSize : base_chunk_size;
+            size_t chunk_size = large_transfer_profile ? std::min(kLargeImageStartChunkSize, base_chunk_size) : base_chunk_size;
             size_t max_recovery_chunk_size = base_chunk_size;
             int chunk_delay_ms = 0;
             int stable_chunk_count = 0;
@@ -615,7 +621,6 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
             bool freeze_recovery = false;
             bool large_probe_attempted = false;
             bool fast_lane_fell_back = false;
-            size_t next_fast_lane_window = use_fast_lane ? kFastLaneWindowSize : 0;
             std::string last_progress_line;
             auto transfer_start = std::chrono::steady_clock::now();
             size_t fast_lane_packet_logs = 0;
@@ -712,10 +717,10 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
                                       << " payload=" << packet.size
                                       << " frame=" << packet.frame.size()
                                       << (use_fast_lane ? " [no-transcode]" : " [hdlc]")
-                                      << " ack=60000ms\n";
+                                      << " ack=" << kLargeImageMidstAckTimeoutMs << "ms\n";
                             ++fast_lane_packet_logs;
                         }
-                        sent_ok = bsl.send_framed_packet_fast(packet.frame, 30000, 60000);
+                        sent_ok = bsl.send_framed_packet_fast(packet.frame, 30000, kLargeImageMidstAckTimeoutMs);
                     }
                 }
                 if (!pipeline_popped) {
@@ -794,22 +799,7 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
 
                 if (chunk_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(chunk_delay_ms));
                 offset += sent_size;
-                if (use_packet_pipeline && next_fast_lane_window != 0 && offset >= next_fast_lane_window) {
-                    pipeline.stop();
-                    std::cout << "\n    fast lane window complete at offset=" << offset
-                              << ", syncing FDL2...\n";
-                    bsl.drain_recv();
-                    bsl.clear_halts();
-                    // CONNECT resets the FDL2 watchdog timer mid-transfer, matching
-                    // ResearchDownload's behaviour every ~128 MB.  ACK failure is
-                    // non-fatal; the download state on the device is not reset.
-                    if (!bsl.connect()) {
-                        std::cout << "    fast lane sync: CONNECT did not ACK, continuing...\n";
-                    }
-                    pipeline.reset(offset, chunk_size);
-                    next_fast_lane_window += kFastLaneWindowSize;
-                }
-                ++stable_chunk_count;
+++stable_chunk_count;
                 if (recovery_cooldown > 0) {
                     --recovery_cooldown;
                 }

@@ -452,7 +452,7 @@ bool BslProtocol::start_data(const std::string& name, uint64_t size, uint32_t ch
 
 bool BslProtocol::midst_data(const uint8_t* data, uint32_t size) {
     auto frame = build_midst_data_packet(data, size);
-    return send_framed_packet(frame, 30000, 60000);
+    return send_framed_packet(frame, 30000, 120000);
 }
 
 bool BslProtocol::end_data(int timeout_ms) {
