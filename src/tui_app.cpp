@@ -13,6 +13,8 @@
 #include <ftxui/screen/color.hpp>
 #include <ftxui/screen/terminal.hpp>
 
+#include <libusb.h>
+
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -33,6 +35,36 @@
 
 namespace fs = std::filesystem;
 using namespace ftxui;
+
+// ─── device presence polling ──────────────────────────────────────────────────
+// Non-claiming scan: only reads descriptors, never opens or claims the device.
+// Safe to run while the child uflash process holds the device.
+
+static std::atomic<int> g_device_present{0}; // 1 = Unisoc device visible on USB
+
+static void device_poller(std::atomic<bool>& stop) {
+    constexpr uint16_t kVid  = 0x1782;
+    constexpr uint16_t kPids[] = {0x4d00, 0x5d00, 0x3d00};
+    while (!stop) {
+        bool found = false;
+        libusb_context* ctx = nullptr;
+        if (libusb_init(&ctx) == 0) {
+            libusb_device** devs = nullptr;
+            ssize_t n = libusb_get_device_list(ctx, &devs);
+            if (n >= 0) {
+                for (ssize_t i = 0; i < n && !found; ++i) {
+                    libusb_device_descriptor d{};
+                    if (libusb_get_device_descriptor(devs[i], &d) == 0 && d.idVendor == kVid)
+                        for (auto pid : kPids) if (d.idProduct == pid) { found = true; break; }
+                }
+                libusb_free_device_list(devs, 1);
+            }
+            libusb_exit(ctx);
+        }
+        g_device_present = found ? 1 : 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    }
+}
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -172,6 +204,10 @@ static void parse_flash_line(const std::string& line, FlashState& st) {
 // ─── shared header ────────────────────────────────────────────────────────────
 
 static Element make_header(const std::string& pac_name, const Opts& opts) {
+    Element dev_elem = g_device_present.load()
+        ? hbox({ text(" ● ") | bold | color(Color::Green),  text("ready ") | color(Color::GrayDark) })
+        : hbox({ text(" ◌ ") | color(Color::GrayDark),      text("waiting ") | color(Color::GrayDark) });
+
     return window(
         hbox({ text(" ⚡ uflash ") | bold | color(Color::Cyan1) }),
         hbox({
@@ -183,6 +219,8 @@ static Element make_header(const std::string& pac_name, const Opts& opts) {
             text(" fast: ") | color(Color::GrayDark),
             text(opts.disable_transcode ? "on " : "off ")
                 | color(opts.disable_transcode ? Color(Color::Cyan1) : Color(Color::GrayDark)),
+            separatorLight(),
+            dev_elem,
         })
     );
 }
@@ -325,7 +363,16 @@ static bool run_selector(const fs::path& pac_path,
         return false;
     });
 
+    std::atomic<bool> ticking{true};
+    std::thread tick([&] {
+        while (ticking) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(900));
+            if (ticking) screen.PostEvent(Event::Custom);
+        }
+    });
     screen.Loop(component);
+    ticking = false;
+    tick.join();
     return started;
 }
 
@@ -649,8 +696,17 @@ int main(int argc, char** argv) {
     }
 
     Opts opts;
-    if (!run_selector(pac_path, items, opts)) return 0;
 
-    fs::path exe = fs::absolute(argv[0]).parent_path() / "uflash";
-    return run_flash(exe, pac_path, items, opts);
+    std::atomic<bool> stop_poller{false};
+    std::thread poller_thd([&]{ device_poller(stop_poller); });
+
+    int result = 0;
+    if (run_selector(pac_path, items, opts)) {
+        fs::path exe = fs::absolute(argv[0]).parent_path() / "uflash";
+        result = run_flash(exe, pac_path, items, opts);
+    }
+
+    stop_poller = true;
+    poller_thd.join();
+    return result;
 }

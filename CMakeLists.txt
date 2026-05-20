@@ -56,6 +56,7 @@ target_link_libraries(uflash-tui
     PRIVATE
     upac_lib
     pugixml
+    PkgConfig::LIBUSB
     ftxui::screen
     ftxui::dom
     ftxui::component

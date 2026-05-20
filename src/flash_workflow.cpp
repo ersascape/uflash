@@ -336,7 +336,7 @@ int load_fdl2(BslProtocol& bsl, const std::string& fdl2_path, uint32_t fdl2_addr
     fread(fdl2_buf.data(), 1, fsize2, f2); fclose(f2);
 
     uint32_t fdl2_checksum = 0; for (uint8_t b : fdl2_buf) fdl2_checksum += b;
-    if (!bsl.start_data(fdl2_addr, fdl2_buf.size(), fdl2_checksum)) {
+    if (!bsl.start_data(fdl2_addr, static_cast<uint32_t>(fdl2_buf.size()), fdl2_checksum)) {
         std::cerr << "error: FDL2 START_DATA failed.\n"; return 1;
     }
 
@@ -648,7 +648,7 @@ void run_flash_phase(BslProtocol& bsl, const upac::PacReader& reader, const fs::
 
             bool start_ok = use_named_download
                 ? bsl.start_data(fc.id_name, buf.size(), checksum, buf.size() >= 0x100000000ULL)
-                : bsl.start_data(static_cast<uint32_t>(fc.base_address), buf.size(), checksum);
+                : bsl.start_data(static_cast<uint32_t>(fc.base_address), static_cast<uint32_t>(buf.size()), checksum);
             if (!start_ok) {
                 std::cerr << "    Skipping " << fc.id << " (not supported in current device state)\n";
                 return true;
@@ -979,7 +979,7 @@ int run_with_connected_device(std::unique_ptr<UsbDevice>& dev, BslProtocol& bsl,
     }
 
     uint32_t fdl1_addr = *fdl1_addr_opt;
-    if (!bsl.start_data(fdl1_addr, fdl1_buf.size(), fdl1_checksum)) {
+    if (!bsl.start_data(fdl1_addr, static_cast<uint32_t>(fdl1_buf.size()), fdl1_checksum)) {
         std::cerr << "error: FDL1 START_DATA failed\n";
         return 1;
     }
