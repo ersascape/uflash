@@ -7,6 +7,14 @@
 int main(int argc, char** argv) {
     bool tty = isatty(STDOUT_FILENO);
 
+    // When stdout is a pipe (TUI subprocess mode), the C library switches to
+    // fully-buffered mode, holding all output until the buffer fills or the
+    // process exits.  Switch to line-buffered so every "\n" line is flushed
+    // to the pipe immediately — the TUI needs real-time updates.
+    if (!tty) {
+        setvbuf(stdout, nullptr, _IOLBF, 0);
+    }
+
     if (tty) {
         std::cout
             << "\x1b[1;36m  ⚡ uflash\x1b[0m"
