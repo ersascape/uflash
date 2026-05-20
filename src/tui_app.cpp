@@ -62,7 +62,9 @@ static void device_poller(std::atomic<bool>& stop) {
             libusb_exit(ctx);
         }
         g_device_present = found ? 1 : 0;
-        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        // Sleep in 50 ms slices so the stop flag is honoured quickly.
+        for (int ms = 0; ms < 800 && !stop; ms += 50)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
@@ -90,6 +92,8 @@ struct FlashState {
     double  mib_done   = 0.0;
     double  mib_total  = 0.0;
     size_t  chunk_bytes = 0;
+    int     active_step = 0;  // 0=Connect 1=BSL 2=FDL1 3=FDL2 4=Init 5=Flash
+    int     steps_done  = 0;  // bitmask: bit i set when step i completes
     std::deque<std::string> log;
     std::unordered_set<std::string> done_partitions;
     bool done      = false;
@@ -143,25 +147,57 @@ static void parse_flash_line(const std::string& line, FlashState& st) {
 
     std::smatch m;
 
-    // ── stage transitions ─────────────────────────────────────────────────────
+    // ── stage + step transitions ──────────────────────────────────────────────
     auto has = [&](const char* s) { return line.find(s) != std::string::npos; };
+    // Mark steps 0..through done and optionally advance active step
+    auto advance = [&](int through, int next_active) {
+        for (int i = 0; i <= through; ++i) st.steps_done |= (1 << i);
+        st.active_step = next_active;
+    };
 
-    if (has("Found Unisoc Device"))                { st.stage = "Device found";   }
-    else if (has("PAC components extracted"))       { st.stage = "Unpacking";      }
-    else if (has("Sending 0x7E") || has("Sending 0xAE") || has("Handshake")) {
-                                                     st.stage = "Handshaking";    }
-    else if (has("Handshake successful") || has("Host Protocol Response")) {
-                                                     st.stage = "Handshake OK";   }
-    else if (has("Loading Stage 1") || has("FDL not detected")) {
-                                                     st.stage = "Loading FDL1";   }
-    else if (has("FDL1 is running"))                { st.stage = "FDL1 running";  }
-    else if (has("Stage 2 (FDL2)") || has("Starting Stage 2")) {
-                                                     st.stage = "Loading FDL2";   }
-    else if (has("Executing FDL2") || has("ExecNandInit")) {
-                                                     st.stage = "ExecNandInit";   }
-    else if (has("Repartition") || has("repartition")) {
-                                                     st.stage = "Repartitioning"; }
-    else if (has("Partition Flashing Phase"))        { st.stage = "Flashing";      }
+    if (has("Found Unisoc Device")) {
+        st.stage = "Device found"; advance(0, 0);
+    } else if (has("PAC components extracted")) {
+        st.stage = "Unpacking"; advance(0, 0);
+    } else if (has("Detected FDL1/FDL2 already running")) {
+        st.stage = "FDL running"; advance(3, 4);
+    } else if (has("Handshake successful") || has("Host Protocol Response")) {
+        st.stage = "Handshake OK"; advance(1, 1);
+    } else if (has("Legacy 0x7E handshake failed")) {
+        st.stage = "Handshaking"; st.sub_stage = "Retry 0xAE"; advance(0, 1);
+    } else if (has("Sending 0x7E") || has("Sending 0xAE") || has("Handshake")) {
+        st.stage = "Handshaking"; advance(0, 1);
+    } else if (has("FDL not detected") || has("Loading Stage 1")) {
+        st.stage = "Loading FDL1"; st.sub_stage = "Transferring"; advance(1, 2);
+    } else if (has("FDL1 is running")) {
+        st.stage = "FDL1 OK"; st.sub_stage = "Executing"; advance(2, 2);
+    } else if (has("Waiting for re-enumeration")) {
+        st.sub_stage = "Re-enumerating";
+    } else if (has("Attempting Stage 2 Handshake")) {
+        st.sub_stage = "Stage 2 sync"; advance(2, 3);
+    } else if (has("Starting Stage 2") || has("Stage 2 (FDL2)")) {
+        st.stage = "Loading FDL2"; st.sub_stage = "Transferring"; advance(2, 3);
+    } else if (has("ChangeBaud") || has("current link settings")) {
+        st.sub_stage = "Baud sync";
+    } else if (has("Executing FDL2") || has("ExecNandInit")) {
+        st.stage = "ExecNandInit"; st.sub_stage = "Waiting"; advance(3, 4);
+    } else if (has("ExecNandInit OK")) {
+        st.sub_stage = "OK";
+    } else if (has("layout mismatch") || has("will repartition")) {
+        st.sub_stage = "Layout mismatch";
+    } else if (has("DisableTransCode enabled")) {
+        st.sub_stage = "Fast mode ON";
+    } else if (has("Backing up") && has("NV")) {
+        st.sub_stage = "NV backup";
+    } else if (has("Sending partition table")) {
+        st.sub_stage = "Writing table";
+    } else if (has("Repartition OK")) {
+        st.sub_stage = "OK";
+    } else if (has("Repartition") || has("repartition")) {
+        st.stage = "Repartitioning"; st.active_step = 4;
+    } else if (has("Partition Flashing Phase")) {
+        st.stage = "Flashing"; advance(4, 5);
+    }
 
     // fast-lane detection
     if (has("[no-transcode]")) st.fast_lane = true;
@@ -555,9 +591,40 @@ static int run_flash(const fs::path& exe, const fs::path& pac_path,
         }
         auto stats_elem = text(stats.str()) | color(Color::GrayDark);
 
+        // ── step strip ───────────────────────────────────────────────────────
+        static constexpr const char* kStepLabels[] =
+            {"Connect", "BSL", "FDL1", "FDL2", "Init", "Flash"};
+        int eff_done = (st.done && st.exit_code == 0) ? 0x3f : st.steps_done;
+        Elements step_elems;
+        for (int i = 0; i < 6; ++i) {
+            if (i > 0) step_elems.push_back(text("  ·  ") | color(Color::GrayDark));
+            bool sdone   = (eff_done >> i) & 1;
+            bool sactive = !st.done && (i == st.active_step);
+            if (sdone) {
+                step_elems.push_back(hbox({
+                    text("✓ ") | color(Color::Green),
+                    text(kStepLabels[i]) | color(Color::GrayDark),
+                }));
+            } else if (sactive) {
+                step_elems.push_back(hbox({
+                    spinner(3, frame) | color(Color::Cyan1),
+                    text(" "),
+                    text(kStepLabels[i]) | bold | color(Color::White),
+                }));
+            } else {
+                step_elems.push_back(text(kStepLabels[i]) | color(Color::GrayDark));
+            }
+        }
+
         auto progress_panel = window(
             text(" Progress ") | bold,
-            vbox({ status_elem, gauge_row, stats_elem })
+            vbox({
+                hbox(std::move(step_elems)),
+                separatorLight(),
+                status_elem,
+                gauge_row,
+                stats_elem,
+            })
         );
 
         // ── partition list ───────────────────────────────────────────────────
@@ -620,7 +687,7 @@ static int run_flash(const fs::path& exe, const fs::path& pac_path,
         // ── log panel ────────────────────────────────────────────────────────
         // Give partitions list + progress about 12 rows; rest goes to log.
         int fixed_rows = 4   // header
-                       + 5   // progress panel
+                       + 7   // progress panel (step strip + separator + status + gauge + stats)
                        + 2 + static_cast<int>(
                              std::count_if(items.begin(), items.end(),
                                            [](const PartitionItem& p){ return p.selected; }));
@@ -702,11 +769,19 @@ int main(int argc, char** argv) {
 
     int result = 0;
     if (run_selector(pac_path, items, opts)) {
+        // Stop the poller before fork()ing uflash.  On macOS, libusb uses IOKit
+        // Mach ports; forking while those are live leaves the child with stale
+        // port state, which causes libusb_claim_interface in uflash to block
+        // indefinitely.  Stopping the poller here drains any in-flight libusb
+        // context before we hand control to the child.
+        stop_poller = true;
+        poller_thd.join();
+
         fs::path exe = fs::absolute(argv[0]).parent_path() / "uflash";
         result = run_flash(exe, pac_path, items, opts);
+    } else {
+        stop_poller = true;
+        poller_thd.join();
     }
-
-    stop_poller = true;
-    poller_thd.join();
     return result;
 }
