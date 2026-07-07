@@ -23,6 +23,9 @@ public:
     void set_debug_io(bool enable) { debug_io_ = enable; }
 
     static std::optional<std::unique_ptr<UsbDevice>> find_any();
+    // Poll until a device appears or timeout_s seconds elapse.
+    // Pass timeout_s < 0 to wait indefinitely. Returns nullopt on timeout.
+    static std::optional<std::unique_ptr<UsbDevice>> wait_for_any(int timeout_s = 60);
 
     UsbDevice(libusb_context* ctx,
               libusb_device_handle* handle,
@@ -38,6 +41,8 @@ public:
     int write(const uint8_t* data, size_t len, unsigned int timeout_ms = 10000);
     int write_fast(const uint8_t* data, size_t len, unsigned int timeout_ms = 10000);
     int read(uint8_t* data, size_t len, unsigned int timeout_ms = 10000);
+    // Flush pending IN data silently; IO errors (endpoint not ready) are suppressed.
+    void drain(unsigned int timeout_ms = 20);
 
 private:
     libusb_context* ctx_ = nullptr;

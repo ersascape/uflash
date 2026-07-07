@@ -1015,7 +1015,37 @@ int run_with_connected_device(std::unique_ptr<UsbDevice>& dev, BslProtocol& bsl,
         std::this_thread::sleep_for(std::chrono::milliseconds(options.fdl2_settle_ms));
     }
 
-    dev2->clear_halt();
+    // On Linux, cdc_acm may have been briefly bound to the re-enumerated device,
+    // leaving bulk endpoints in a halted/error state. Probe for up to 2 s:
+    // clear halts, drain, and check if the OUT endpoint accepts a zero-length
+    // probe write. Once it does (or after timeout), hand off to handshake().
+    {
+        constexpr int kEndpointReadyTimeoutMs = 2000;
+        constexpr int kEndpointPollIntervalMs = 100;
+        auto ep_deadline = std::chrono::steady_clock::now()
+                         + std::chrono::milliseconds(kEndpointReadyTimeoutMs);
+        bool endpoint_ready = false;
+        while (std::chrono::steady_clock::now() < ep_deadline) {
+            dev2->clear_halt();
+            dev2->drain(20);
+            // A single 0x00 byte is a benign probe: FDL1 discards garbage bytes
+            // before the BSL frame start tag, but libusb only returns success
+            // when the endpoint actually accepted the transfer.  A zero-length
+            // write() bypasses libusb_bulk_transfer entirely and always returns 0.
+            uint8_t probe = 0x00;
+            int wr = dev2->write(&probe, 1, 100);
+            if (wr >= 0) {
+                endpoint_ready = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(kEndpointPollIntervalMs));
+        }
+        if (!endpoint_ready) {
+            // Endpoints never came up clean; do a final clear and let
+            // handshake()'s own IO-error recovery handle it.
+            dev2->clear_halt();
+        }
+    }
 
     BslProtocol bsl2(*dev2);
     dev2->set_debug_io(options.debug_protocol);
@@ -1065,9 +1095,9 @@ int run_flash_tool(const CliOptions& options) {
     }
 
     if (options.reset_only) {
-        auto d_opt = UsbDevice::find_any();
+        auto d_opt = UsbDevice::wait_for_any();
         if (!d_opt) {
-            std::cerr << "error: no device found for reset\n";
+            std::cerr << "error: no Unisoc device found after waiting.\n";
             return 1;
         }
         BslProtocol b_reset(**d_opt);

@@ -123,31 +123,46 @@ std::vector<uint8_t> BslProtocol::frame_packet(uint16_t type, const uint8_t* pay
 }
 
 bool BslProtocol::handshake(int timeout_ms) {
-    // Conservative flush; some devices need a wider quiet window before they
-    // start accepting the handshake burst reliably.
-    uint8_t garbage[4096];
-    while (dev_.read(garbage, sizeof(garbage), 20) > 0);
+    // Flush without printing IO errors — endpoint may not be live yet after re-enum.
+    dev_.drain(20);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    while (dev_.read(garbage, sizeof(garbage), 20) > 0);
+    dev_.drain(20);
 
     std::cout << "Sending 0x7E handshake (32-byte burst)...\n";
     std::vector<uint8_t> burst(32, BSL_FRAME_TAG);
-    
+
     auto start = std::chrono::steady_clock::now();
-    while (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() < timeout_ms) {
-        dev_.write(burst.data(), burst.size(), 500);
-        
+    bool last_iter_had_io_error = false;
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start).count() < timeout_ms) {
+        // On Linux, after re-enumeration cdc_acm may have left endpoints halted.
+        // Clear halts before every retry that followed an IO error so transfers
+        // can proceed once FDL1's USB stack finishes initialising.
+        if (last_iter_had_io_error) {
+            dev_.clear_halt();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        last_iter_had_io_error = false;
+
+        int wr = dev_.write(burst.data(), burst.size(), 500);
+        if (wr < 0 && wr != LIBUSB_ERROR_TIMEOUT) {
+            last_iter_had_io_error = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
         uint8_t resp[1024];
         int r = dev_.read(resp, sizeof(resp), 500);
         if (r > 0) {
             for (int i = 0; i < r; ++i) {
                 if (resp[i] == BSL_FRAME_TAG && (i + 1 < r)) {
-                    // Check if it's the start of a version string (usually 0x00 0x81 or 0x81 0x00)
                     std::cout << "Handshake successful! (RX: " << r << " bytes)\n";
                     last_handshake_response_.assign(resp, resp + r);
                     return true;
                 }
             }
+        } else if (r < 0 && r != LIBUSB_ERROR_TIMEOUT) {
+            last_iter_had_io_error = true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }

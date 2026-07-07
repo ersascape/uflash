@@ -80,6 +80,14 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
         return false;
     }
 
+    // Clear any endpoint halts the kernel driver may have left behind when it
+    // was force-detached.  On macOS 15+ AppleUSBCDCACMData can leave the bulk
+    // OUT endpoint in HALT state; SET_CONTROL_LINE_STATE alone does not clear
+    // it, so the first write would STALL and time out regardless.  Errors here
+    // are benign — the BROM may not support CLEAR_FEATURE(HALT) on ep0.
+    libusb_clear_halt(handle, selection.ep_out);
+    libusb_clear_halt(handle, selection.ep_in);
+
     // SET_INTERFACE to alt 0: on macOS this initialises the IOKit interface
     // service before bulk transfers can be issued.  Ignore errors; a BROM
     // that does not implement this request will stall ep0 but the bulk
@@ -102,6 +110,11 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
                             nullptr,
                             0,
                             1000);
+
+    // Second clear after the control transfer: on some host controllers the
+    // STALL caused by a BROM NAKing SET_CONTROL_LINE_STATE re-halts the
+    // endpoint; clearing again ensures the OUT endpoint is ready to accept data.
+    libusb_clear_halt(handle, selection.ep_out);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     return true;
@@ -200,6 +213,29 @@ std::optional<std::unique_ptr<UsbDevice>> UsbDevice::find_any() {
                                            found_selection.interface_number);
     }
     libusb_exit(ctx);
+    return std::nullopt;
+}
+
+std::optional<std::unique_ptr<UsbDevice>> UsbDevice::wait_for_any(int timeout_s) {
+    using clock = std::chrono::steady_clock;
+
+    auto dev = find_any();
+    if (dev) return dev;
+
+    if (timeout_s == 0) return std::nullopt;
+
+    auto deadline = timeout_s < 0
+        ? clock::time_point::max()
+        : clock::now() + std::chrono::seconds(timeout_s);
+
+    std::cout << "Waiting for Unisoc device...\n";
+
+    while (clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        dev = find_any();
+        if (dev) return dev;
+    }
+
     return std::nullopt;
 }
 
@@ -344,6 +380,16 @@ void UsbDevice::clear_halt() {
         libusb_clear_halt(handle_, ep_in_);
         libusb_clear_halt(handle_, ep_out_);
     }
+}
+
+void UsbDevice::drain(unsigned int timeout_ms) {
+    if (!handle_) return;
+    uint8_t buf[4096];
+    int transferred = 0;
+    // Read until the endpoint returns no data or any error (including IO).
+    // IO errors here just mean the endpoint isn't ready yet — not a fault.
+    while (libusb_bulk_transfer(handle_, ep_in_, buf, sizeof(buf),
+                                &transferred, timeout_ms) == 0 && transferred > 0) {}
 }
 
 void UsbDevice::dump_descriptors() {
