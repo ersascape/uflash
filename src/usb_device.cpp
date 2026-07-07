@@ -80,14 +80,6 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
         return false;
     }
 
-    // Clear any endpoint halts the kernel driver may have left behind when it
-    // was force-detached.  On macOS 15+ AppleUSBCDCACMData can leave the bulk
-    // OUT endpoint in HALT state; SET_CONTROL_LINE_STATE alone does not clear
-    // it, so the first write would STALL and time out regardless.  Errors here
-    // are benign — the BROM may not support CLEAR_FEATURE(HALT) on ep0.
-    libusb_clear_halt(handle, selection.ep_out);
-    libusb_clear_halt(handle, selection.ep_in);
-
     // SET_INTERFACE to alt 0: on macOS this initialises the IOKit interface
     // service before bulk transfers can be issued.  Ignore errors; a BROM
     // that does not implement this request will stall ep0 but the bulk
@@ -111,9 +103,11 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
                             0,
                             1000);
 
-    // Second clear after the control transfer: on some host controllers the
-    // STALL caused by a BROM NAKing SET_CONTROL_LINE_STATE re-halts the
-    // endpoint; clearing again ensures the OUT endpoint is ready to accept data.
+    // On macOS 15+ AppleUSBCDCACMData can leave the bulk OUT endpoint halted
+    // after it is force-detached, and SET_CONTROL_LINE_STATE on a BROM that
+    // does not implement the request may re-stall it.  A single clear here
+    // after all control transfers ensures the OUT endpoint accepts the first
+    // bulk write.  Errors are benign — not all BROMs support CLEAR_FEATURE.
     libusb_clear_halt(handle, selection.ep_out);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

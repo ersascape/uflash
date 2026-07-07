@@ -1123,29 +1123,64 @@ int run_flash_tool(const CliOptions& options) {
         return 1;
     }
 
-    auto& dev = *dev_opt;
-    BslProtocol bsl(*dev);
-    bool handshake_ok = bsl.handshake();
-    if (!handshake_ok) {
-        std::cout << "Legacy 0x7E handshake failed, trying modern 0xAE Host Protocol...\n";
-        handshake_ok = bsl.host_handshake();
-    }
-    if (!handshake_ok) {
-        std::cerr << "error: all handshake methods failed.\n";
+    // Scope bsl inside a block so it is destroyed before we potentially
+    // replace dev_opt below (BslProtocol holds a UsbDevice& that would dangle).
+    {
+        auto& dev = *dev_opt;
+        BslProtocol bsl(dev);
+        bool handshake_ok = bsl.handshake();
+        if (!handshake_ok) {
+            std::cout << "Legacy 0x7E handshake failed, trying modern 0xAE Host Protocol...\n";
+            handshake_ok = bsl.host_handshake();
+        }
+        if (handshake_ok) {
+            std::string handshake_ver = bsl.get_last_handshake_response();
+            std::cout << "Handshake successful! Response: " << handshake_ver << "\n";
+            fs::path tmp_dir = "/tmp/uflash_extract";
+            fs::create_directories(tmp_dir);
+            if (reader.extract_all(tmp_dir)) {
+                std::cout << "PAC components extracted to " << tmp_dir << "\n";
+            }
+            bool fdl_running = handshake_ver.find("Spreadtrum") != std::string::npos;
+            return run_with_connected_device(dev, bsl, reader, options, tmp_dir, fdl_running);
+        }
+    } // bsl destroyed here; safe to replace dev_opt
+
+    // Handshake failed — issue a USB bus reset to clear any stale endpoint
+    // state (data toggle mismatch, halts left by a prior session or kernel
+    // driver), then wait for the BROM to re-enumerate with a clean handle.
+    std::cout << "All handshake methods failed; issuing USB reset and retrying...\n";
+    (*dev_opt)->reset();
+    dev_opt.reset(); // close stale handle before wait_for_any
+
+    dev_opt = UsbDevice::wait_for_any(30);
+    if (!dev_opt) {
+        std::cerr << "error: device did not re-appear after USB reset.\n";
         return 1;
     }
 
-    std::string handshake_ver = bsl.get_last_handshake_response();
-    std::cout << "Handshake successful! Response: " << handshake_ver << "\n";
-
-    fs::path tmp_dir = "/tmp/uflash_extract";
-    fs::create_directories(tmp_dir);
-    if (reader.extract_all(tmp_dir)) {
-        std::cout << "PAC components extracted to " << tmp_dir << "\n";
+    {
+        auto& dev = *dev_opt;
+        BslProtocol bsl(dev);
+        bool handshake_ok = bsl.handshake();
+        if (!handshake_ok) {
+            std::cout << "Legacy 0x7E handshake failed, trying modern 0xAE Host Protocol...\n";
+            handshake_ok = bsl.host_handshake();
+        }
+        if (!handshake_ok) {
+            std::cerr << "error: all handshake methods failed.\n";
+            return 1;
+        }
+        std::string handshake_ver = bsl.get_last_handshake_response();
+        std::cout << "Handshake successful! Response: " << handshake_ver << "\n";
+        fs::path tmp_dir = "/tmp/uflash_extract";
+        fs::create_directories(tmp_dir);
+        if (reader.extract_all(tmp_dir)) {
+            std::cout << "PAC components extracted to " << tmp_dir << "\n";
+        }
+        bool fdl_running = handshake_ver.find("Spreadtrum") != std::string::npos;
+        return run_with_connected_device(dev, bsl, reader, options, tmp_dir, fdl_running);
     }
-
-    bool fdl_running = handshake_ver.find("Spreadtrum") != std::string::npos;
-    return run_with_connected_device(dev, bsl, reader, options, tmp_dir, fdl_running);
 }
 
 } // namespace uflash
