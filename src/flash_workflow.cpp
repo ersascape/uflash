@@ -1127,7 +1127,7 @@ int run_flash_tool(const CliOptions& options) {
     // replace dev_opt below (BslProtocol holds a UsbDevice& that would dangle).
     {
         auto& dev = *dev_opt;
-        BslProtocol bsl(dev);
+        BslProtocol bsl(*dev);
         bool handshake_ok = bsl.handshake();
         if (!handshake_ok) {
             std::cout << "Legacy 0x7E handshake failed, trying modern 0xAE Host Protocol...\n";
@@ -1161,7 +1161,7 @@ int run_flash_tool(const CliOptions& options) {
 
     {
         auto& dev = *dev_opt;
-        BslProtocol bsl(dev);
+        BslProtocol bsl(*dev);
         bool handshake_ok = bsl.handshake();
         if (!handshake_ok) {
             std::cout << "Legacy 0x7E handshake failed, trying modern 0xAE Host Protocol...\n";
