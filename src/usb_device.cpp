@@ -65,13 +65,24 @@ bool prepare_handle_for_interface(libusb_device_handle* handle, const EndpointSe
         std::cerr << "usb: detach kernel driver: " << libusb_error_name(dr) << "\n";
     }
 
-    // Always set configuration 1, even when it is already active.  On macOS
-    // this causes IOKit to temporarily release any bound interface drivers
-    // (e.g. AppleUSBCDCACMData), opening a window for claim_interface to
-    // seize the interface before the driver re-binds.  Ignore errors here;
-    // the device may already be in config 1 and the kernel may reject a
-    // redundant SET_CONFIGURATION — we attempt the claim regardless.
+    // On macOS, SET_CONFIGURATION(1) even when the device is already in
+    // config 1 causes IOKit to temporarily release any bound interface
+    // drivers (e.g. AppleUSBCDCACMData), opening a window for
+    // claim_interface to succeed.  On Linux this sends a real USB
+    // SET_CONFIGURATION request to the device; for some BROMs this
+    // triggers a full interface reinitialisation, leaving bulk endpoints
+    // temporarily unavailable.  Skip it on Linux when the device is
+    // already in the correct configuration.
+#ifdef __APPLE__
     libusb_set_configuration(handle, 1);
+#else
+    {
+        int cur_cfg = 0;
+        if (libusb_get_configuration(handle, &cur_cfg) != 0 || cur_cfg != 1) {
+            libusb_set_configuration(handle, 1);
+        }
+    }
+#endif
 
     int cr = libusb_claim_interface(handle, selection.interface_number);
     if (cr != 0) {
